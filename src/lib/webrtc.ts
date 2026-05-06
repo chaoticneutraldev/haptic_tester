@@ -1,7 +1,12 @@
 import { type OfferBundleV1, type AnswerBundleV1 } from './signaling'
 import { formatSignalingForPaste, parseSignalingPaste } from './signalingCodec'
 
-export const DEFAULT_ICE_SERVERS: RTCIceServer[] = [{ urls: 'stun:stun.l.google.com:19302' }]
+export const DEFAULT_ICE_SERVERS: RTCIceServer[] = [
+  { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] },
+]
+
+/** Browsers (especially Safari / iOS) may never set iceGatheringState to "complete"; stop waiting after this. */
+const ICE_GATHER_SOFT_TIMEOUT_MS = 20_000
 
 export type TimelineEvent = {
   id: string
@@ -34,25 +39,38 @@ export function createPeerConnection(): RTCPeerConnection {
   return new RTCPeerConnection({ iceServers: DEFAULT_ICE_SERVERS })
 }
 
-async function waitIceComplete(pc: RTCPeerConnection): Promise<void> {
+/**
+ * Wait until ICE gathering is done, or we have waited long enough.
+ * Never rejects: manual signaling still works with SDP + candidates collected so far.
+ */
+async function waitIceGatheringDone(pc: RTCPeerConnection): Promise<void> {
   if (pc.iceGatheringState === 'complete') return
-  await new Promise<void>((resolve, reject) => {
-    const to = window.setTimeout(() => {
-      cleanup()
-      reject(new Error('ICE gathering timed out'))
-    }, 25_000)
-    const cleanup = () => {
-      window.clearTimeout(to)
-      pc.removeEventListener('icegatheringstatechange', onState)
+
+  await new Promise<void>((resolve) => {
+    let settled = false
+    const finish = () => {
+      if (settled) return
+      settled = true
+      window.clearTimeout(timer)
+      pc.removeEventListener('icegatheringstatechange', onGathering)
+      pc.removeEventListener('icecandidate', onIce)
+      resolve()
     }
-    const onState = () => {
-      if (pc.iceGatheringState === 'complete') {
-        cleanup()
-        resolve()
-      }
+
+    const timer = window.setTimeout(finish, ICE_GATHER_SOFT_TIMEOUT_MS)
+
+    const onGathering = () => {
+      if (pc.iceGatheringState === 'complete') finish()
     }
-    pc.addEventListener('icegatheringstatechange', onState)
-    onState()
+
+    /** Standard end-of-trickle signal; some WebKit builds omit "complete" but fire this. */
+    const onIce = (e: RTCPeerConnectionIceEvent) => {
+      if (e.candidate === null) finish()
+    }
+
+    pc.addEventListener('icegatheringstatechange', onGathering)
+    pc.addEventListener('icecandidate', onIce)
+    onGathering()
   })
 }
 
@@ -75,7 +93,7 @@ export async function hostCreateOffer(): Promise<{
   const channel = pc.createDataChannel('haptic', { ordered: true })
   const offer = await pc.createOffer()
   await pc.setLocalDescription(offer)
-  await waitIceComplete(pc)
+  await waitIceGatheringDone(pc)
   const ice = candidates.map((c) => ({
     candidate: c.candidate,
     sdpMid: c.sdpMid,
@@ -119,7 +137,7 @@ export async function guestHandleOffer(offerRaw: string): Promise<{
 
   const answer = await pc.createAnswer()
   await pc.setLocalDescription(answer)
-  await waitIceComplete(pc)
+  await waitIceGatheringDone(pc)
 
   const ice = candidates.map((c) => ({
     candidate: c.candidate,
