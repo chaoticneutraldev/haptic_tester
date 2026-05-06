@@ -19,6 +19,46 @@ type Role = 'pick' | 'host' | 'guest'
 
 type HostStep = 'idle' | 'offer-ready' | 'connected'
 
+/** Live WebRTC transport state (SDP is already exchanged; this is the network path + data channel). */
+type PeerNetSnapshot = {
+  ice: RTCIceConnectionState
+  connection: RTCPeerConnectionState
+  dataChannel?: RTCDataChannelState
+}
+
+function IcePathPanel({ snap, context }: { snap: PeerNetSnapshot | null; context: 'host' | 'guest' }) {
+  if (!snap) return null
+  const iceFailed = snap.ice === 'failed'
+  const connFailed = snap.connection === 'failed'
+
+  return (
+    <div className="ice-path-panel">
+      <p className="muted ice-path-panel__line">
+        <strong>Network path:</strong> ICE <code>{snap.ice}</code>, peers <code>{snap.connection}</code>
+        {snap.dataChannel !== undefined && (
+          <>
+            , data channel <code>{snap.dataChannel}</code>
+          </>
+        )}
+      </p>
+      {!iceFailed && !connFailed && (snap.ice === 'checking' || snap.connection === 'connecting') && (
+        <p className="muted">
+          {context === 'host'
+            ? 'Still trying to reach the guest over the network (not a copy/paste step). Can take 15–30s.'
+            : 'Still trying to reach the host over the network. Ensure they already tapped “Apply answer” with your latest answer.'}
+        </p>
+      )}
+      {(iceFailed || connFailed) && (
+        <p className="warn">
+          The browsers could not establish a direct link. This app uses only STUN (no TURN relay). Try{' '}
+          <strong>both devices on the same Wi‑Fi</strong>, turn off VPNs, or use one phone’s hotspot for the other—then
+          run <strong>Generate offer</strong> again on the host and redo the blobs.
+        </p>
+      )}
+    </div>
+  )
+}
+
 function newEvent(offsetMs: number, presetId: string): TimelineEvent {
   return { id: crypto.randomUUID(), offsetMs, presetId }
 }
@@ -100,9 +140,9 @@ function HostSignalingProgress({
     }
     if (step === 'offer-ready' && hostHandoff) {
       return {
-        title: 'Step 4 of 4 — Almost there',
+        title: 'Step 4 of 4 — Network in progress',
         detail:
-          'Answer applied. Waiting for the data channel to open. If this lingers, confirm the guest sent you the latest answer and tapped through their steps.',
+          'Signaling is done. The data channel opens only after ICE/DTLS succeeds between devices. Check “Network path” below—if ICE fails, use the same Wi‑Fi or a hotspot and generate a new offer.',
       }
     }
     return {
@@ -145,16 +185,16 @@ function GuestSignalingProgress({
     }
     if (busy && hasAnswer) {
       return {
-        title: 'Step 3 of 4 — Waiting for host',
+        title: 'Step 3 of 4 — Waiting for network',
         detail:
-          'Answer is ready. Send it to the host now. Waiting while they apply it and the data channel finishes opening.',
+          'Answer is ready—send it to the host if you have not. Waiting for ICE/DTLS: the devices must find a direct network path (see “Network path” below).',
       }
     }
     if (hasAnswer) {
       return {
         title: 'Step 3 of 4 — Send the answer',
         detail:
-          'Copy or QR the answer to the host. After they tap “Apply answer”, this page should connect automatically.',
+          'Copy or QR the answer to the host. After they tap “Apply answer”, the data channel opens only if ICE connects (same Wi‑Fi often required).',
       }
     }
     return {
@@ -182,6 +222,7 @@ function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolea
   const channelRef = useRef<RTCDataChannel | null>(null)
   /** Ignores stale async completions if “Generate offer” is clicked again while ICE is still running */
   const hostOfferGenerationRef = useRef(0)
+  const [hostNetSnap, setHostNetSnap] = useState<PeerNetSnapshot | null>(null)
   const [offerText, setOfferText] = useState('')
   const [answerInput, setAnswerInput] = useState('')
 
@@ -256,6 +297,7 @@ function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolea
     setError(null)
     setHostHandoff(false)
     setAnswerInput('')
+    setHostNetSnap(null)
     const gen = ++hostOfferGenerationRef.current
     setBusy(true)
     try {
@@ -271,9 +313,21 @@ function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolea
         /* host typically does not need guest messages */
         void ev
       }
+      const pushHostNet = () => {
+        setHostNetSnap({
+          ice: pc.iceConnectionState,
+          connection: pc.connectionState,
+          dataChannel: channel.readyState,
+        })
+      }
+      pc.addEventListener('iceconnectionstatechange', pushHostNet)
+      pc.addEventListener('connectionstatechange', pushHostNet)
+      channel.addEventListener('open', pushHostNet)
+      pushHostNet()
       setOfferText(text)
       setStep('offer-ready')
       channel.onopen = () => {
+        pushHostNet()
         setHostHandoff(false)
         setStep('connected')
       }
@@ -376,6 +430,8 @@ function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolea
       </p>
 
       <HostSignalingProgress step={step} busy={busy} hostHandoff={hostHandoff} />
+
+      {step !== 'connected' && hostNetSnap && <IcePathPanel snap={hostNetSnap} context="host" />}
 
       {step !== 'connected' && (
         <section className="panel stack">
@@ -577,6 +633,7 @@ function GuestFlow({ onBack, supported }: { onBack: () => void; supported: boole
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [connected, setConnected] = useState(false)
+  const [guestNetSnap, setGuestNetSnap] = useState<PeerNetSnapshot | null>(null)
   const pcRef = useRef<RTCPeerConnection | null>(null)
   const channelRef = useRef<RTCDataChannel | null>(null)
   const guestTimeouts = useRef<number[]>([])
@@ -677,17 +734,38 @@ function GuestFlow({ onBack, supported }: { onBack: () => void; supported: boole
 
   const createAnswer = async () => {
     setError(null)
+    setGuestNetSnap(null)
     setBusy(true)
     try {
       pcRef.current?.close()
       const { pc, answerText: ans, waitForChannel } = await guestHandleOffer(offerIn.trim())
       pcRef.current = pc
       setAnswerText(ans)
+
+      const pushGuestNet = () => {
+        setGuestNetSnap({
+          ice: pc.iceConnectionState,
+          connection: pc.connectionState,
+          dataChannel: channelRef.current?.readyState,
+        })
+      }
+      pc.addEventListener('iceconnectionstatechange', pushGuestNet)
+      pc.addEventListener('connectionstatechange', pushGuestNet)
+      pushGuestNet()
+
       const ch = await waitForChannel()
       channelRef.current = ch
+      ch.addEventListener('open', () => {
+        pushGuestNet()
+        setConnected(true)
+      })
+      ch.addEventListener('closing', pushGuestNet)
+      pushGuestNet()
       ch.onmessage = (ev) => handleDcMessage(typeof ev.data === 'string' ? ev.data : '')
-      if (ch.readyState === 'open') setConnected(true)
-      else ch.onopen = () => setConnected(true)
+      if (ch.readyState === 'open') {
+        pushGuestNet()
+        setConnected(true)
+      }
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed to handle offer')
     } finally {
@@ -709,6 +787,8 @@ function GuestFlow({ onBack, supported }: { onBack: () => void; supported: boole
       </p>
 
       <GuestSignalingProgress connected={connected} busy={busy} hasAnswer={Boolean(answerText)} />
+
+      {!connected && guestNetSnap && <IcePathPanel snap={guestNetSnap} context="guest" />}
 
       {!connected && (
         <section className="panel stack">
