@@ -160,8 +160,28 @@ export async function guestHandleOffer(offerRaw: string): Promise<{
 
 /** HOST: apply answer from guest */
 export async function hostApplyAnswer(pc: RTCPeerConnection, answerRaw: string): Promise<void> {
+  if (pc.signalingState === 'closed') {
+    throw new Error('Connection was closed. Generate a new offer and pair again.')
+  }
+
   const bundle = await parseSignalingPaste(answerRaw)
   if (bundle.kind !== 'answer') throw new Error('Expected answer bundle')
+
+  if (pc.signalingState === 'stable') {
+    if (pc.localDescription?.type === 'offer' && pc.remoteDescription?.type === 'answer') {
+      return
+    }
+    throw new Error(
+      'This device is not waiting for an answer (wrong signaling state). Tap “Generate offer” once, send that offer to the guest, then paste only the answer that matches it—avoid double-tapping Generate.',
+    )
+  }
+
+  if (pc.signalingState !== 'have-local-offer') {
+    throw new Error(
+      `Cannot apply answer while signaling is “${pc.signalingState}”. Generate a new offer and run through pairing again.`,
+    )
+  }
+
   await pc.setRemoteDescription({ type: 'answer', sdp: bundle.sdp })
   for (const c of bundle.ice) {
     try {

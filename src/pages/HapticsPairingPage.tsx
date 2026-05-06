@@ -63,13 +63,125 @@ export function HapticsPairingPage() {
   return <GuestFlow onBack={() => setRole('pick')} supported={supported} />
 }
 
+function HostSignalingProgress({
+  step,
+  busy,
+  hostHandoff,
+}: {
+  step: HostStep
+  busy: boolean
+  hostHandoff: boolean
+}) {
+  const line = useMemo(() => {
+    if (step === 'connected') {
+      return {
+        title: 'Connected',
+        detail: 'Data channel is open. You can send haptics to the guest.',
+      }
+    }
+    if (step === 'idle' && busy) {
+      return {
+        title: 'Step 1 of 4 — Working…',
+        detail: 'Creating the WebRTC offer and gathering ICE candidates (network discovery). This can take a few seconds.',
+      }
+    }
+    if (step === 'idle') {
+      return {
+        title: 'Step 1 of 4 — Start',
+        detail:
+          'Tap “Generate offer” once and wait for the blob to appear. Tapping again while it’s working can invalidate pairing.',
+      }
+    }
+    if (step === 'offer-ready' && busy) {
+      return {
+        title: 'Step 3 of 4 — Working…',
+        detail: 'Applying the guest’s answer and finishing ICE on this device.',
+      }
+    }
+    if (step === 'offer-ready' && hostHandoff) {
+      return {
+        title: 'Step 4 of 4 — Almost there',
+        detail:
+          'Answer applied. Waiting for the data channel to open. If this lingers, confirm the guest sent you the latest answer and tapped through their steps.',
+      }
+    }
+    return {
+      title: 'Step 2 of 4 — Share the offer',
+      detail:
+        'Send the offer blob to the guest (copy, QR, or AirDrop). When they send back an answer, paste it below and tap “Apply answer”.',
+    }
+  }, [step, busy, hostHandoff])
+
+  return (
+    <div className="signaling-progress" role="status" aria-live="polite">
+      <p className="signaling-progress__title">{line.title}</p>
+      <p className="signaling-progress__detail">{line.detail}</p>
+    </div>
+  )
+}
+
+function GuestSignalingProgress({
+  connected,
+  busy,
+  hasAnswer,
+}: {
+  connected: boolean
+  busy: boolean
+  hasAnswer: boolean
+}) {
+  const line = useMemo(() => {
+    if (connected) {
+      return {
+        title: 'Connected',
+        detail: 'Listening for haptics from the host. This screen stays read-only.',
+      }
+    }
+    if (busy && !hasAnswer) {
+      return {
+        title: 'Step 2 of 4 — Working…',
+        detail:
+          'Parsing the offer, creating an answer, and gathering ICE candidates. On some phones this can take 10–20 seconds.',
+      }
+    }
+    if (busy && hasAnswer) {
+      return {
+        title: 'Step 3 of 4 — Waiting for host',
+        detail:
+          'Answer is ready. Send it to the host now. Waiting while they apply it and the data channel finishes opening.',
+      }
+    }
+    if (hasAnswer) {
+      return {
+        title: 'Step 3 of 4 — Send the answer',
+        detail:
+          'Copy or QR the answer to the host. After they tap “Apply answer”, this page should connect automatically.',
+      }
+    }
+    return {
+      title: 'Step 1 of 4 — Prepare',
+      detail:
+        'Optionally type the host’s session code for your notes, paste the offer they gave you, then tap “Create answer”.',
+    }
+  }, [connected, busy, hasAnswer])
+
+  return (
+    <div className="signaling-progress" role="status" aria-live="polite">
+      <p className="signaling-progress__title">{line.title}</p>
+      <p className="signaling-progress__detail">{line.detail}</p>
+    </div>
+  )
+}
+
 function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolean }) {
   const sessionId = useMemo(() => generateSessionId(), [])
   const [step, setStep] = useState<HostStep>('idle')
   const [busy, setBusy] = useState(false)
+  const [hostHandoff, setHostHandoff] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const pcRef = useRef<RTCPeerConnection | null>(null)
   const channelRef = useRef<RTCDataChannel | null>(null)
+  /** Ignores stale async completions if “Generate offer” is clicked again while ICE is still running */
+  const hostOfferGenerationRef = useRef(0)
   const [offerText, setOfferText] = useState('')
   const [answerInput, setAnswerInput] = useState('')
 
@@ -142,10 +254,17 @@ function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolea
 
   const generateOffer = async () => {
     setError(null)
+    setHostHandoff(false)
+    setAnswerInput('')
+    const gen = ++hostOfferGenerationRef.current
     setBusy(true)
     try {
       pcRef.current?.close()
       const { pc, channel, offerText: text } = await hostCreateOffer()
+      if (gen !== hostOfferGenerationRef.current) {
+        pc.close()
+        return
+      }
       pcRef.current = pc
       channelRef.current = channel
       channel.onmessage = (ev) => {
@@ -154,12 +273,22 @@ function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolea
       }
       setOfferText(text)
       setStep('offer-ready')
-      channel.onopen = () => setStep('connected')
-      if (channel.readyState === 'open') setStep('connected')
+      channel.onopen = () => {
+        setHostHandoff(false)
+        setStep('connected')
+      }
+      if (channel.readyState === 'open') {
+        setHostHandoff(false)
+        setStep('connected')
+      }
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Failed to create offer')
+      if (gen === hostOfferGenerationRef.current) {
+        setError(e instanceof Error ? e.message : 'Failed to create offer')
+      }
     } finally {
-      setBusy(false)
+      if (gen === hostOfferGenerationRef.current) {
+        setBusy(false)
+      }
     }
   }
 
@@ -170,7 +299,9 @@ function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolea
     setBusy(true)
     try {
       await hostApplyAnswer(pc, answerInput.trim())
+      setHostHandoff(true)
     } catch (e) {
+      setHostHandoff(false)
       setError(e instanceof Error ? e.message : 'Invalid answer')
     } finally {
       setBusy(false)
@@ -244,6 +375,8 @@ function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolea
         Session code: <strong>{sessionId}</strong> (read this aloud to the guest for verification)
       </p>
 
+      <HostSignalingProgress step={step} busy={busy} hostHandoff={hostHandoff} />
+
       {step !== 'connected' && (
         <section className="panel stack">
           <h2>Manual signaling</h2>
@@ -288,9 +421,17 @@ function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolea
                 spellCheck={false}
                 placeholder={`${SIGNALING_COMPACT_PREFIX}... or paste JSON`}
               />
-              <button type="button" className="btn btn-primary" disabled={busy || !answerInput.trim()} onClick={applyAnswer}>
+              <button
+                type="button"
+                className="btn btn-primary"
+                disabled={busy || !answerInput.trim() || hostHandoff}
+                onClick={applyAnswer}
+              >
                 Apply answer
               </button>
+              {hostHandoff && (
+                <p className="muted">Answer applied—waiting for the data channel. If it fails, use “Generate offer” to start over.</p>
+              )}
             </li>
           </ol>
           {error && <p className="warn">{error}</p>}
@@ -566,6 +707,8 @@ function GuestFlow({ onBack, supported }: { onBack: () => void; supported: boole
         Enter the HOST session code for your own reference, paste the offer blob (compact or JSON), then send the answer
         blob back to the HOST.
       </p>
+
+      <GuestSignalingProgress connected={connected} busy={busy} hasAnswer={Boolean(answerText)} />
 
       {!connected && (
         <section className="panel stack">

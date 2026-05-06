@@ -510,6 +510,29 @@ textarea.input {
   opacity: 0.9;
 }
 
+.signaling-progress {
+  padding: 0.75rem 1rem;
+  border-radius: 0.5rem;
+  background: color-mix(in srgb, var(--surface-2) 85%, var(--surface));
+  border: 1px solid var(--border);
+  border-left-width: 4px;
+  border-left-color: var(--accent);
+}
+
+.signaling-progress__title {
+  margin: 0;
+  font-size: 0.95rem;
+  font-weight: 600;
+  color: var(--text-h);
+}
+
+.signaling-progress__detail {
+  margin: 0.4rem 0 0;
+  font-size: 0.9rem;
+  color: var(--muted);
+  line-height: 1.45;
+}
+
 code {
   font-family: var(--mono);
   font-size: 0.9em;
