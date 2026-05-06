@@ -1,0 +1,635 @@
+import { QRCodeSVG } from 'qrcode.react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { HAPTIC_PRESETS, getPresetById } from '../lib/hapticPresets'
+import { QR_SAFE_MAX_LEN, parseSignalingBundle } from '../lib/signaling'
+import { generateSessionId } from '../lib/sessionId'
+import {
+  hostApplyAnswer,
+  hostCreateOffer,
+  guestHandleOffer,
+  parseDcMessage,
+  stringifyDcMessage,
+  type DcMessage,
+  type TimelineEvent,
+} from '../lib/webrtc'
+import { vibratePattern, vibrateSupported } from '../lib/vibrate'
+
+type Role = 'pick' | 'host' | 'guest'
+
+type HostStep = 'idle' | 'offer-ready' | 'connected'
+
+function newEvent(offsetMs: number, presetId: string): TimelineEvent {
+  return { id: crypto.randomUUID(), offsetMs, presetId }
+}
+
+function quantize(ms: number, grid = 50): number {
+  return Math.round(ms / grid) * grid
+}
+
+export function HapticsPairingPage() {
+  const supported = vibrateSupported()
+  const [role, setRole] = useState<Role>('pick')
+
+  if (role === 'pick') {
+    return (
+      <div className="page stack">
+        <h1>Haptics pairing</h1>
+        <p className="lede">
+          WebRTC data channel with <strong>manual signaling</strong>: you copy or scan offer/answer JSON between
+          devices. The short session code is only a human label so both people know they are on the same session.
+        </p>
+        <p className="callout">
+          Pairing is not private—anyone with the blobs could connect. Use the same Wi‑Fi when possible; without TURN,
+          some networks will fail.
+        </p>
+        <div className="row">
+          <button type="button" className="btn btn-primary" onClick={() => setRole('host')}>
+            I am HOST
+          </button>
+          <button type="button" className="btn" onClick={() => setRole('guest')}>
+            I am GUEST
+          </button>
+        </div>
+      </div>
+    )
+  }
+
+  if (role === 'host') {
+    return <HostFlow onBack={() => setRole('pick')} supported={supported} />
+  }
+
+  return <GuestFlow onBack={() => setRole('pick')} supported={supported} />
+}
+
+function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolean }) {
+  const sessionId = useMemo(() => generateSessionId(), [])
+  const [step, setStep] = useState<HostStep>('idle')
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const pcRef = useRef<RTCPeerConnection | null>(null)
+  const channelRef = useRef<RTCDataChannel | null>(null)
+  const [offerText, setOfferText] = useState('')
+  const [answerInput, setAnswerInput] = useState('')
+
+  const [mode, setMode] = useState<'instant' | 'pattern'>('instant')
+  const [durationMs, setDurationMs] = useState(2000)
+  const [events, setEvents] = useState<TimelineEvent[]>([])
+  const [playing, setPlaying] = useState(false)
+  const [playheadMs, setPlayheadMs] = useState(0)
+  const playheadRaf = useRef<number | null>(null)
+  const playAnchor = useRef<{ startAt: number; startPlayhead: number } | null>(null)
+  const localTimeouts = useRef<number[]>([])
+
+  const send = useCallback((msg: DcMessage) => {
+    const ch = channelRef.current
+    if (ch && ch.readyState === 'open') ch.send(stringifyDcMessage(msg))
+  }, [])
+
+  const clearLocalSched = useCallback(() => {
+    localTimeouts.current.forEach((id) => window.clearTimeout(id))
+    localTimeouts.current = []
+  }, [])
+
+  const broadcastPatternState = useCallback(
+    (overrides?: Partial<{ playing: boolean; playheadMs: number }>) => {
+      send({
+        v: 1,
+        t: 'patternState',
+        durationMs,
+        events,
+        playheadMs: overrides?.playheadMs ?? playheadMs,
+        playing: overrides?.playing ?? playing,
+      })
+    },
+    [durationMs, events, playheadMs, playing, send],
+  )
+
+  useEffect(() => {
+    if (step !== 'connected' || mode !== 'pattern') return
+    if (!playing) {
+      if (playheadRaf.current) cancelAnimationFrame(playheadRaf.current)
+      playheadRaf.current = null
+      return
+    }
+    const loop = () => {
+      const anchor = playAnchor.current
+      if (!anchor) return
+      const elapsed = Date.now() - anchor.startAt
+      const next = Math.min(durationMs, anchor.startPlayhead + elapsed)
+      setPlayheadMs(next)
+      if (next >= durationMs) {
+        setPlaying(false)
+        playAnchor.current = null
+        send({ v: 1, t: 'pause', playheadMs: durationMs })
+        broadcastPatternState({ playing: false, playheadMs: durationMs })
+        return
+      }
+      playheadRaf.current = requestAnimationFrame(loop)
+    }
+    playheadRaf.current = requestAnimationFrame(loop)
+    return () => {
+      if (playheadRaf.current) cancelAnimationFrame(playheadRaf.current)
+    }
+  }, [playing, step, mode, durationMs, send, broadcastPatternState])
+
+  useEffect(() => {
+    if (step !== 'connected' || mode !== 'pattern') return
+    if (playing) return
+    broadcastPatternState()
+  }, [events, durationMs, step, mode, playing, broadcastPatternState, playheadMs])
+
+  const generateOffer = async () => {
+    setError(null)
+    setBusy(true)
+    try {
+      pcRef.current?.close()
+      const { pc, channel, offerText: text } = await hostCreateOffer()
+      pcRef.current = pc
+      channelRef.current = channel
+      channel.onmessage = (ev) => {
+        /* host typically does not need guest messages */
+        void ev
+      }
+      setOfferText(text)
+      setStep('offer-ready')
+      channel.onopen = () => setStep('connected')
+      if (channel.readyState === 'open') setStep('connected')
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Failed to create offer')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const applyAnswer = async () => {
+    const pc = pcRef.current
+    if (!pc) return
+    setError(null)
+    setBusy(true)
+    try {
+      parseSignalingBundle(answerInput.trim())
+      await hostApplyAnswer(pc, answerInput.trim())
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Invalid answer')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const playInstant = (presetId: string) => {
+    const p = getPresetById(presetId)
+    if (p) vibratePattern(p.pattern)
+    send({ v: 1, t: 'instant', presetId })
+  }
+
+  const startPatternPlayback = () => {
+    clearLocalSched()
+    const startAt = Date.now() + 180
+    const initial = playheadMs
+    playAnchor.current = { startAt, startPlayhead: initial }
+    setPlaying(true)
+    send({ v: 1, t: 'play', startAt, durationMs, events, initialPlayheadMs: initial })
+
+    const now = Date.now()
+    const delay0 = Math.max(0, startAt - now)
+    for (const ev of events) {
+      if (ev.offsetMs < initial) continue
+      const t = window.setTimeout(() => {
+        const p = getPresetById(ev.presetId)
+        if (p) vibratePattern(p.pattern)
+      }, delay0 + (ev.offsetMs - initial))
+      localTimeouts.current.push(t)
+    }
+  }
+
+  const pausePatternPlayback = () => {
+    clearLocalSched()
+    playAnchor.current = null
+    setPlaying(false)
+    send({ v: 1, t: 'pause', playheadMs })
+    broadcastPatternState({ playing: false, playheadMs })
+  }
+
+  const adjustDuration = (delta: number) => {
+    setDurationMs((d) => Math.min(16000, Math.max(1000, d + delta)))
+  }
+
+  const addEventAtPlayhead = (presetId: string) => {
+    setEvents((ev) => [...ev, newEvent(quantize(playheadMs), presetId)])
+  }
+
+  const removeEvent = (id: string) => {
+    setEvents((ev) => ev.filter((e) => e.id !== id))
+  }
+
+  const onTimelineClick = (e: React.MouseEvent<HTMLDivElement>) => {
+    if (playing) return
+    const rect = (e.currentTarget as HTMLDivElement).getBoundingClientRect()
+    const x = e.clientX - rect.left
+    const ratio = Math.min(1, Math.max(0, x / rect.width))
+    const ms = quantize(ratio * durationMs)
+    setPlayheadMs(ms)
+  }
+
+  return (
+    <div className="page stack">
+      <div className="row spread">
+        <h1>HOST</h1>
+        <button type="button" className="btn btn-ghost" onClick={onBack}>
+          Change role
+        </button>
+      </div>
+      <p className="session-code">
+        Session code: <strong>{sessionId}</strong> (read this aloud to the guest for verification)
+      </p>
+
+      {step !== 'connected' && (
+        <section className="panel stack">
+          <h2>Manual signaling</h2>
+          <ol className="steps">
+            <li>
+              <p>Generate an offer. Send the blob to the GUEST (copy or QR if it fits).</p>
+              {step === 'idle' && (
+                <button type="button" className="btn btn-primary" disabled={busy} onClick={generateOffer}>
+                  Generate offer
+                </button>
+              )}
+            </li>
+            {offerText && (
+              <li>
+                <p>Offer JSON</p>
+                <div className="row wrap">
+                  <button
+                    type="button"
+                    className="btn"
+                    onClick={() => navigator.clipboard.writeText(offerText).catch(() => {})}
+                  >
+                    Copy offer
+                  </button>
+                  {offerText.length <= QR_SAFE_MAX_LEN ? (
+                    <div className="qr-box">
+                      <QRCodeSVG value={offerText} size={160} level="L" />
+                    </div>
+                  ) : (
+                    <p className="muted">Offer too large for QR ({offerText.length} chars). Use copy instead.</p>
+                  )}
+                </div>
+                <textarea className="input mono" readOnly rows={6} value={offerText} spellCheck={false} />
+              </li>
+            )}
+            <li>
+              <p>Paste the answer JSON from the GUEST, then connect.</p>
+              <textarea
+                className="input mono"
+                rows={6}
+                value={answerInput}
+                onChange={(e) => setAnswerInput(e.target.value)}
+                spellCheck={false}
+                placeholder='{"v":1,"kind":"answer",...}'
+              />
+              <button type="button" className="btn btn-primary" disabled={busy || !answerInput.trim()} onClick={applyAnswer}>
+                Apply answer
+              </button>
+            </li>
+          </ol>
+          {error && <p className="warn">{error}</p>}
+        </section>
+      )}
+
+      {step === 'connected' && (
+        <>
+          <p className="ok">Data channel open. Use the panel below; the guest device will mirror pattern view.</p>
+
+          <div className="panel row wrap">
+            <label className="toggle">
+              <span>Mode</span>
+              <select value={mode} onChange={(e) => setMode(e.target.value as 'instant' | 'pattern')}>
+                <option value="instant">Instant</option>
+                <option value="pattern">Pattern</option>
+              </select>
+            </label>
+          </div>
+
+          {mode === 'instant' && (
+            <section className="panel stack">
+              <h2>Haptic actions</h2>
+              {!supported && <p className="muted">This device cannot vibrate, but commands still send to the guest.</p>}
+              <div className="preset-grid">
+                {HAPTIC_PRESETS.map((p) => (
+                  <button key={p.id} type="button" className="preset-cell" onClick={() => playInstant(p.id)}>
+                    <span className="preset-name">{p.name}</span>
+                  </button>
+                ))}
+              </div>
+            </section>
+          )}
+
+          {mode === 'pattern' && (
+            <section className="panel stack">
+              <h2>Pattern timeline</h2>
+              <p className="muted">
+                Sheet-style timeline: add haptic “notes”, extend length, play/pause. Guests see updates but cannot edit.
+              </p>
+              <div className="row wrap">
+                <button type="button" className="btn" onClick={() => adjustDuration(-1000)} disabled={durationMs <= 1000}>
+                  −1s
+                </button>
+                <button type="button" className="btn" onClick={() => adjustDuration(1000)} disabled={durationMs >= 16000}>
+                  +1s
+                </button>
+                <span className="pill">
+                  Length {(durationMs / 1000).toFixed(0)}s (1–16s)
+                </span>
+                {!playing ? (
+                  <button type="button" className="btn btn-primary" onClick={startPatternPlayback}>
+                    Play
+                  </button>
+                ) : (
+                  <button type="button" className="btn" onClick={pausePatternPlayback}>
+                    Pause
+                  </button>
+                )}
+              </div>
+
+              <div
+                className="timeline"
+                onClick={onTimelineClick}
+                role="slider"
+                aria-valuemin={0}
+                aria-valuemax={durationMs}
+                aria-valuenow={playheadMs}
+                tabIndex={0}
+                onKeyDown={(e) => {
+                  if (playing) return
+                  if (e.key === 'ArrowRight') setPlayheadMs((p) => quantize(Math.min(durationMs, p + 100)))
+                  if (e.key === 'ArrowLeft') setPlayheadMs((p) => quantize(Math.max(0, p - 100)))
+                }}
+              >
+                <div className="timeline-inner">
+                  {events.map((ev) => (
+                    <button
+                      key={ev.id}
+                      type="button"
+                      className="timeline-note"
+                      style={{ left: `${(ev.offsetMs / durationMs) * 100}%` }}
+                      title={`${ev.presetId} @ ${ev.offsetMs}ms`}
+                      onClick={(e) => {
+                        e.stopPropagation()
+                        if (!playing) setPlayheadMs(ev.offsetMs)
+                      }}
+                    />
+                  ))}
+                  <div className="timeline-playhead" style={{ left: `${(playheadMs / durationMs) * 100}%` }} />
+                </div>
+              </div>
+
+              <div className="row wrap">
+                <label className="field inline">
+                  <span>Add at playhead</span>
+                  <select
+                    key={events.length}
+                    defaultValue=""
+                    onChange={(e) => {
+                      const v = e.target.value
+                      if (v) addEventAtPlayhead(v)
+                    }}
+                    disabled={playing}
+                  >
+                    <option value="">Select preset…</option>
+                    {HAPTIC_PRESETS.map((p) => (
+                      <option key={p.id} value={p.id}>
+                        {p.name}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              </div>
+
+              <ul className="event-list">
+                {events.map((ev) => {
+                  const p = getPresetById(ev.presetId)
+                  return (
+                    <li key={ev.id} className="event-row">
+                      <span>
+                        {p?.name ?? ev.presetId} @ {ev.offsetMs}ms
+                      </span>
+                      <button type="button" className="btn btn-ghost" disabled={playing} onClick={() => removeEvent(ev.id)}>
+                        Remove
+                      </button>
+                    </li>
+                  )
+                })}
+              </ul>
+            </section>
+          )}
+        </>
+      )}
+    </div>
+  )
+}
+
+function GuestFlow({ onBack, supported }: { onBack: () => void; supported: boolean }) {
+  const [sessionInput, setSessionInput] = useState('')
+  const [offerIn, setOfferIn] = useState('')
+  const [answerText, setAnswerText] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [connected, setConnected] = useState(false)
+  const pcRef = useRef<RTCPeerConnection | null>(null)
+  const channelRef = useRef<RTCDataChannel | null>(null)
+  const guestTimeouts = useRef<number[]>([])
+
+  const [modeView, setModeView] = useState<'instant' | 'pattern'>('instant')
+  const [durationMs, setDurationMs] = useState(2000)
+  const [events, setEvents] = useState<TimelineEvent[]>([])
+  const [playing, setPlaying] = useState(false)
+  const [playheadMs, setPlayheadMs] = useState(0)
+  const playheadRaf = useRef<number | null>(null)
+  const playAnchor = useRef<{ startAt: number; startPlayhead: number } | null>(null)
+
+  const clearGuestSched = () => {
+    guestTimeouts.current.forEach((id) => window.clearTimeout(id))
+    guestTimeouts.current = []
+  }
+
+  useEffect(() => {
+    return () => {
+      clearGuestSched()
+      pcRef.current?.close()
+    }
+  }, [])
+
+  const handleDcMessage = useCallback(
+    (raw: string) => {
+      const msg = parseDcMessage(raw)
+      if (!msg) return
+      if (msg.t === 'instant') {
+        const p = getPresetById(msg.presetId)
+        if (p && supported) vibratePattern(p.pattern)
+        return
+      }
+      if (msg.t === 'patternState') {
+        setModeView('pattern')
+        setDurationMs(msg.durationMs)
+        setEvents(msg.events)
+        setPlaying(msg.playing)
+        setPlayheadMs(msg.playheadMs)
+        return
+      }
+      if (msg.t === 'play') {
+        setModeView('pattern')
+        clearGuestSched()
+        setDurationMs(msg.durationMs)
+        setEvents(msg.events)
+        setPlaying(true)
+        const startAt = msg.startAt
+        const initial = msg.initialPlayheadMs
+        setPlayheadMs(initial)
+        const now = Date.now()
+        const delay0 = Math.max(0, startAt - now)
+        playAnchor.current = { startAt, startPlayhead: initial }
+        for (const ev of msg.events) {
+          if (ev.offsetMs < initial) continue
+          const t = window.setTimeout(() => {
+            const p = getPresetById(ev.presetId)
+            if (p && supported) vibratePattern(p.pattern)
+          }, delay0 + (ev.offsetMs - initial))
+          guestTimeouts.current.push(t)
+        }
+        return
+      }
+      if (msg.t === 'pause') {
+        clearGuestSched()
+        playAnchor.current = null
+        setPlaying(false)
+        setPlayheadMs(msg.playheadMs)
+      }
+    },
+    [supported],
+  )
+
+  useEffect(() => {
+    if (!connected || modeView !== 'pattern' || !playing) {
+      if (playheadRaf.current) cancelAnimationFrame(playheadRaf.current)
+      playheadRaf.current = null
+      return
+    }
+    const loop = () => {
+      const anchor = playAnchor.current
+      if (!anchor) return
+      const elapsed = Date.now() - anchor.startAt
+      const next = Math.min(durationMs, anchor.startPlayhead + elapsed)
+      setPlayheadMs(next)
+      if (next >= durationMs) {
+        setPlaying(false)
+        playAnchor.current = null
+        return
+      }
+      playheadRaf.current = requestAnimationFrame(loop)
+    }
+    playheadRaf.current = requestAnimationFrame(loop)
+    return () => {
+      if (playheadRaf.current) cancelAnimationFrame(playheadRaf.current)
+    }
+  }, [connected, modeView, playing, durationMs])
+
+  const createAnswer = async () => {
+    setError(null)
+    setBusy(true)
+    try {
+      parseSignalingBundle(offerIn.trim())
+      pcRef.current?.close()
+      const { pc, answerText: ans, waitForChannel } = await guestHandleOffer(offerIn.trim())
+      pcRef.current = pc
+      setAnswerText(ans)
+      const ch = await waitForChannel()
+      channelRef.current = ch
+      ch.onmessage = (ev) => handleDcMessage(typeof ev.data === 'string' ? ev.data : '')
+      if (ch.readyState === 'open') setConnected(true)
+      else ch.onopen = () => setConnected(true)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Failed to handle offer')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <div className="page stack guest">
+      <div className="row spread">
+        <h1>GUEST</h1>
+        <button type="button" className="btn btn-ghost" onClick={onBack}>
+          Change role
+        </button>
+      </div>
+      <p className="lede">
+        Enter the HOST session code for your own reference, paste the offer JSON, then send the answer JSON back to the
+        HOST.
+      </p>
+
+      {!connected && (
+        <section className="panel stack">
+          <label className="field">
+            <span>HOST session code (optional verification)</span>
+            <input className="input" value={sessionInput} onChange={(e) => setSessionInput(e.target.value.toUpperCase())} maxLength={12} />
+          </label>
+          <label className="field">
+            <span>Paste offer JSON from HOST</span>
+            <textarea className="input mono" rows={6} value={offerIn} onChange={(e) => setOfferIn(e.target.value)} spellCheck={false} />
+          </label>
+          <button type="button" className="btn btn-primary" disabled={busy || !offerIn.trim()} onClick={createAnswer}>
+            Create answer
+          </button>
+          {answerText && (
+            <>
+              <p>Send this answer JSON to the HOST (copy or QR).</p>
+              <div className="row wrap">
+                <button type="button" className="btn" onClick={() => navigator.clipboard.writeText(answerText).catch(() => {})}>
+                  Copy answer
+                </button>
+                {answerText.length <= QR_SAFE_MAX_LEN ? (
+                  <div className="qr-box">
+                    <QRCodeSVG value={answerText} size={160} level="L" />
+                  </div>
+                ) : (
+                  <p className="muted">Answer too large for QR. Use copy.</p>
+                )}
+              </div>
+              <textarea className="input mono" readOnly rows={6} value={answerText} spellCheck={false} />
+            </>
+          )}
+          {error && <p className="warn">{error}</p>}
+        </section>
+      )}
+
+      {connected && (
+        <section className="panel stack">
+          <h2>Receiving haptics</h2>
+          <p className="ok">Connected. This UI is read-only.</p>
+          {!supported && <p className="warn">Vibration API not available—patterns will not be felt here.</p>}
+          {modeView === 'instant' && <p className="muted">Waiting for instant taps from the host…</p>}
+          {modeView === 'pattern' && (
+            <>
+              <h3>Timeline (mirror)</h3>
+              <div className="timeline timeline--readonly">
+                <div className="timeline-inner">
+                  {events.map((ev) => (
+                    <div
+                      key={ev.id}
+                      className="timeline-note timeline-note--readonly"
+                      style={{ left: `${(ev.offsetMs / durationMs) * 100}%` }}
+                    />
+                  ))}
+                  <div className="timeline-playhead" style={{ left: `${(playheadMs / durationMs) * 100}%` }} />
+                </div>
+              </div>
+              <p className="muted">
+                {playing ? 'Playing…' : 'Paused'} — {(durationMs / 1000).toFixed(1)}s
+              </p>
+            </>
+          )}
+        </section>
+      )}
+    </div>
+  )
+}
