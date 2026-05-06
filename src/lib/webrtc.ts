@@ -1,4 +1,5 @@
-import { parseSignalingBundle, stringifySignalingBundle, type OfferBundleV1, type AnswerBundleV1 } from './signaling'
+import { type OfferBundleV1, type AnswerBundleV1 } from './signaling'
+import { formatSignalingForPaste, parseSignalingPaste } from './signalingCodec'
 
 export const DEFAULT_ICE_SERVERS: RTCIceServer[] = [{ urls: 'stun:stun.l.google.com:19302' }]
 
@@ -86,7 +87,7 @@ export async function hostCreateOffer(): Promise<{
     sdp: pc.localDescription?.sdp ?? '',
     ice,
   }
-  return { pc, channel, offerText: stringifySignalingBundle(bundle) }
+  return { pc, channel, offerText: await formatSignalingForPaste(bundle) }
 }
 
 /** GUEST: apply offer, create answer */
@@ -95,7 +96,7 @@ export async function guestHandleOffer(offerRaw: string): Promise<{
   answerText: string
   waitForChannel: () => Promise<RTCDataChannel>
 }> {
-  const bundle = parseSignalingBundle(offerRaw)
+  const bundle = await parseSignalingPaste(offerRaw)
   if (bundle.kind !== 'offer') throw new Error('Expected offer bundle')
 
   const pc = createPeerConnection()
@@ -134,14 +135,14 @@ export async function guestHandleOffer(offerRaw: string): Promise<{
 
   return {
     pc,
-    answerText: stringifySignalingBundle(answerBundle),
+    answerText: await formatSignalingForPaste(answerBundle),
     waitForChannel: () => channelPromise,
   }
 }
 
 /** HOST: apply answer from guest */
 export async function hostApplyAnswer(pc: RTCPeerConnection, answerRaw: string): Promise<void> {
-  const bundle = parseSignalingBundle(answerRaw)
+  const bundle = await parseSignalingPaste(answerRaw)
   if (bundle.kind !== 'answer') throw new Error('Expected answer bundle')
   await pc.setRemoteDescription({ type: 'answer', sdp: bundle.sdp })
   for (const c of bundle.ice) {

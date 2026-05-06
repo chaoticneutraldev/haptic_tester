@@ -1,7 +1,8 @@
 import { QRCodeSVG } from 'qrcode.react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { HAPTIC_PRESETS, getPresetById } from '../lib/hapticPresets'
-import { QR_SAFE_MAX_LEN, parseSignalingBundle } from '../lib/signaling'
+import { QR_SAFE_MAX_LEN } from '../lib/signaling'
+import { SIGNALING_COMPACT_PREFIX } from '../lib/signalingCodec'
 import { generateSessionId } from '../lib/sessionId'
 import {
   hostApplyAnswer,
@@ -35,8 +36,9 @@ export function HapticsPairingPage() {
       <div className="page stack">
         <h1>Haptics pairing</h1>
         <p className="lede">
-          WebRTC data channel with <strong>manual signaling</strong>: you copy or scan offer/answer JSON between
-          devices. The short session code is only a human label so both people know they are on the same session.
+          WebRTC data channel with <strong>manual signaling</strong>: copy or scan offer/answer blobs between devices.
+          Blobs are usually <strong>gzip-compressed and base64url-encoded</strong> (prefix <code>{SIGNALING_COMPACT_PREFIX}</code>
+          ) for a shorter paste; plain JSON still works. The session code is only a human label.
         </p>
         <p className="callout">
           Pairing is not private—anyone with the blobs could connect. Use the same Wi‑Fi when possible; without TURN,
@@ -167,7 +169,6 @@ function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolea
     setError(null)
     setBusy(true)
     try {
-      parseSignalingBundle(answerInput.trim())
       await hostApplyAnswer(pc, answerInput.trim())
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Invalid answer')
@@ -257,7 +258,7 @@ function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolea
             </li>
             {offerText && (
               <li>
-                <p>Offer JSON</p>
+                <p>Offer ({offerText.startsWith(SIGNALING_COMPACT_PREFIX) ? 'compact' : 'JSON'}) — {offerText.length} chars</p>
                 <div className="row wrap">
                   <button
                     type="button"
@@ -274,18 +275,18 @@ function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolea
                     <p className="muted">Offer too large for QR ({offerText.length} chars). Use copy instead.</p>
                   )}
                 </div>
-                <textarea className="input mono" readOnly rows={6} value={offerText} spellCheck={false} />
+                <textarea className="input mono" readOnly rows={4} value={offerText} spellCheck={false} />
               </li>
             )}
             <li>
-              <p>Paste the answer JSON from the GUEST, then connect.</p>
+              <p>Paste the answer from the GUEST (compact or JSON), then connect.</p>
               <textarea
                 className="input mono"
                 rows={6}
                 value={answerInput}
                 onChange={(e) => setAnswerInput(e.target.value)}
                 spellCheck={false}
-                placeholder='{"v":1,"kind":"answer",...}'
+                placeholder={`${SIGNALING_COMPACT_PREFIX}... or paste JSON`}
               />
               <button type="button" className="btn btn-primary" disabled={busy || !answerInput.trim()} onClick={applyAnswer}>
                 Apply answer
@@ -537,7 +538,6 @@ function GuestFlow({ onBack, supported }: { onBack: () => void; supported: boole
     setError(null)
     setBusy(true)
     try {
-      parseSignalingBundle(offerIn.trim())
       pcRef.current?.close()
       const { pc, answerText: ans, waitForChannel } = await guestHandleOffer(offerIn.trim())
       pcRef.current = pc
@@ -563,8 +563,8 @@ function GuestFlow({ onBack, supported }: { onBack: () => void; supported: boole
         </button>
       </div>
       <p className="lede">
-        Enter the HOST session code for your own reference, paste the offer JSON, then send the answer JSON back to the
-        HOST.
+        Enter the HOST session code for your own reference, paste the offer blob (compact or JSON), then send the answer
+        blob back to the HOST.
       </p>
 
       {!connected && (
@@ -574,15 +574,25 @@ function GuestFlow({ onBack, supported }: { onBack: () => void; supported: boole
             <input className="input" value={sessionInput} onChange={(e) => setSessionInput(e.target.value.toUpperCase())} maxLength={12} />
           </label>
           <label className="field">
-            <span>Paste offer JSON from HOST</span>
-            <textarea className="input mono" rows={6} value={offerIn} onChange={(e) => setOfferIn(e.target.value)} spellCheck={false} />
+            <span>Paste offer from HOST</span>
+            <textarea
+              className="input mono"
+              rows={6}
+              value={offerIn}
+              onChange={(e) => setOfferIn(e.target.value)}
+              spellCheck={false}
+              placeholder={`${SIGNALING_COMPACT_PREFIX}… or JSON`}
+            />
           </label>
           <button type="button" className="btn btn-primary" disabled={busy || !offerIn.trim()} onClick={createAnswer}>
             Create answer
           </button>
           {answerText && (
             <>
-              <p>Send this answer JSON to the HOST (copy or QR).</p>
+              <p>
+                Send this answer to the HOST ({answerText.startsWith(SIGNALING_COMPACT_PREFIX) ? 'compact' : 'JSON'}) —{' '}
+                {answerText.length} chars (copy or QR).
+              </p>
               <div className="row wrap">
                 <button type="button" className="btn" onClick={() => navigator.clipboard.writeText(answerText).catch(() => {})}>
                   Copy answer
@@ -595,7 +605,7 @@ function GuestFlow({ onBack, supported }: { onBack: () => void; supported: boole
                   <p className="muted">Answer too large for QR. Use copy.</p>
                 )}
               </div>
-              <textarea className="input mono" readOnly rows={6} value={answerText} spellCheck={false} />
+              <textarea className="input mono" readOnly rows={4} value={answerText} spellCheck={false} />
             </>
           )}
           {error && <p className="warn">{error}</p>}
