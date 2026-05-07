@@ -14,6 +14,16 @@
   status = 200
 
 [[redirects]]
+  from = "/api/signal/session"
+  to = "/.netlify/functions/signal-session"
+  status = 200
+
+[[redirects]]
+  from = "/api/signal/state/*"
+  to = "/.netlify/functions/signal-state/:splat"
+  status = 200
+
+[[redirects]]
   from = "/*"
   to = "/index.html"
   status = 200

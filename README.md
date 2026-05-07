@@ -47,6 +47,8 @@ The frontend requests ICE config from `/api/turn/ice-config`. The function:
 - `METERED_APP_NAME` (example: `haptic-test-cndev.metered.live`)
 - `METERED_SECRET_KEY`
 - `DEFAULT_EXPIRY_SECONDS` (optional, default `86400`)
+- `UPSTASH_REDIS_REST_URL` (for shortcode signaling state)
+- `UPSTASH_REDIS_REST_TOKEN` (for shortcode signaling state)
 
 ### Function endpoints
 
@@ -57,3 +59,4 @@ The frontend requests ICE config from `/api/turn/ice-config`. The function:
 
 - If the TURN function is unavailable, WebRTC falls back to STUN-only.
 - Pairing uses manual signaling blobs (compressed when available); the 8-character session code is a human label.
+- Shortcode signaling uses Redis-backed state with 15-minute host/guest match TTL, then 12-hour active TTL after answer is posted.

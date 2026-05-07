@@ -4,6 +4,7 @@ import { HAPTIC_PRESETS, getPresetById } from '../lib/hapticPresets'
 import { QR_SAFE_MAX_LEN } from '../lib/signaling'
 import { SIGNALING_COMPACT_PREFIX } from '../lib/signalingCodec'
 import { generateSessionId } from '../lib/sessionId'
+import { createSignalSession, getSignalState, postSignalAnswer, postSignalOffer } from '../lib/signalApi'
 import {
   hostApplyAnswer,
   hostCreateOffer,
@@ -226,6 +227,7 @@ function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolea
   const [hostNetSnap, setHostNetSnap] = useState<PeerNetSnapshot | null>(null)
   const [offerText, setOfferText] = useState('')
   const [answerInput, setAnswerInput] = useState('')
+  const [pairCode, setPairCode] = useState('')
 
   const [mode, setMode] = useState<'instant' | 'pattern'>('instant')
   const [durationMs, setDurationMs] = useState(2000)
@@ -326,6 +328,9 @@ function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolea
       channel.addEventListener('open', pushHostNet)
       pushHostNet()
       setOfferText(text)
+      const signal = await createSignalSession()
+      setPairCode(signal.code)
+      await postSignalOffer(signal.code, text)
       setStep('offer-ready')
       channel.onopen = () => {
         pushHostNet()
@@ -362,6 +367,21 @@ function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolea
       setBusy(false)
     }
   }
+
+  useEffect(() => {
+    if (!pairCode || step === 'connected') return
+    const timer = window.setInterval(async () => {
+      try {
+        const s = await getSignalState(pairCode)
+        if (s.answer && !answerInput) {
+          setAnswerInput(s.answer)
+        }
+      } catch {
+        /* best-effort polling */
+      }
+    }, 2000)
+    return () => window.clearInterval(timer)
+  }, [pairCode, step, answerInput])
 
   const playInstant = (presetId: string) => {
     const p = getPresetById(presetId)
@@ -429,6 +449,11 @@ function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolea
       <p className="session-code">
         Session code: <strong>{sessionId}</strong> (read this aloud to the guest for verification)
       </p>
+      {pairCode && (
+        <p className="session-code">
+          Pair code: <strong>{pairCode}</strong> (share this 8-character code; match TTL 15m, active TTL 12h)
+        </p>
+      )}
 
       <HostSignalingProgress step={step} busy={busy} hostHandoff={hostHandoff} />
 
@@ -439,7 +464,7 @@ function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolea
           <h2>Manual signaling</h2>
           <ol className="steps">
             <li>
-              <p>Generate an offer. Send the blob to the GUEST (copy or QR if it fits).</p>
+              <p>Generate an offer. Share the pair code with the guest. Blob copy/QR remains available as fallback.</p>
               {step === 'idle' && (
                 <button type="button" className="btn btn-primary" disabled={busy} onClick={generateOffer}>
                   Generate offer
@@ -469,7 +494,7 @@ function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolea
               </li>
             )}
             <li>
-              <p>Paste the answer from the GUEST (compact or JSON), then connect.</p>
+              <p>Paste the answer from the GUEST (or wait for auto-fill from pair code), then connect.</p>
               <textarea
                 className="input mono"
                 rows={6}
@@ -738,10 +763,22 @@ function GuestFlow({ onBack, supported }: { onBack: () => void; supported: boole
     setGuestNetSnap(null)
     setBusy(true)
     try {
+      let resolvedOffer = offerIn.trim()
+      const enteredCode = sessionInput.trim().toUpperCase()
+      if (!resolvedOffer && enteredCode.length >= 6) {
+        const s = await getSignalState(enteredCode)
+        if (!s.offer) throw new Error('Host offer is not ready for this code yet')
+        resolvedOffer = s.offer
+        setOfferIn(resolvedOffer)
+      }
+      if (!resolvedOffer) throw new Error('Paste an offer or enter a valid pair code')
       pcRef.current?.close()
-      const { pc, answerText: ans, waitForChannel } = await guestHandleOffer(offerIn.trim())
+      const { pc, answerText: ans, waitForChannel } = await guestHandleOffer(resolvedOffer)
       pcRef.current = pc
       setAnswerText(ans)
+      if (enteredCode.length >= 6) {
+        await postSignalAnswer(enteredCode, ans)
+      }
 
       const pushGuestNet = () => {
         setGuestNetSnap({
@@ -783,8 +820,7 @@ function GuestFlow({ onBack, supported }: { onBack: () => void; supported: boole
         </button>
       </div>
       <p className="lede">
-        Enter the HOST session code for your own reference, paste the offer blob (compact or JSON), then send the answer
-        blob back to the HOST.
+        Enter the HOST pair code to fetch/post signaling automatically, or use manual blob paste as fallback.
       </p>
 
       <GuestSignalingProgress connected={connected} busy={busy} hasAnswer={Boolean(answerText)} />
@@ -794,7 +830,7 @@ function GuestFlow({ onBack, supported }: { onBack: () => void; supported: boole
       {!connected && (
         <section className="panel stack">
           <label className="field">
-            <span>HOST session code (optional verification)</span>
+            <span>HOST pair code (shortcode mode)</span>
             <input className="input" value={sessionInput} onChange={(e) => setSessionInput(e.target.value.toUpperCase())} maxLength={12} />
           </label>
           <label className="field">
