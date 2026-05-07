@@ -78,13 +78,13 @@ export function HapticsPairingPage() {
       <div className="page stack">
         <h1>Haptics pairing</h1>
         <p className="lede">
-          WebRTC data channel with <strong>manual signaling</strong>: copy or scan offer/answer blobs between devices.
-          Blobs are usually <strong>gzip-compressed and base64url-encoded</strong> (prefix <code>{SIGNALING_COMPACT_PREFIX}</code>
-          ) for a shorter paste; plain JSON still works. The session code is only a human label.
+          WebRTC data channel with <strong>shortcode signaling</strong>: HOST generates an 8-character pair code and
+          GUEST joins with that code. Manual offer/answer blob copy (compact format <code>{SIGNALING_COMPACT_PREFIX}</code>
+          ) is available as fallback.
         </p>
         <p className="callout">
-          Pairing is not private—anyone with the blobs could connect. Use the same Wi‑Fi when possible; without TURN,
-          some networks will fail.
+          Pairing is not private—anyone with the pair code or fallback blobs could connect. Use the same Wi‑Fi when
+          possible; without a reachable relay path some networks can still fail.
         </p>
         <div className="row">
           <button type="button" className="btn btn-primary" onClick={() => setRole('host')}>
@@ -150,7 +150,7 @@ function HostSignalingProgress({
     return {
       title: 'Step 2 of 4 — Share the offer',
       detail:
-        'Send the offer blob to the guest (copy, QR, or AirDrop). When they send back an answer, paste it below and tap “Apply answer”.',
+        'Share the pair code with the guest. Manual blob/QR is only needed if shortcode sync fails.',
     }
   }, [step, busy, hostHandoff])
 
@@ -202,7 +202,7 @@ function GuestSignalingProgress({
     return {
       title: 'Step 1 of 4 — Prepare',
       detail:
-        'Optionally type the host’s session code for your notes, paste the offer they gave you, then tap “Create answer”.',
+        'Enter the host pair code and tap “Create answer”. Manual offer paste is fallback only.',
     }
   }, [connected, busy, hasAnswer])
 
@@ -228,6 +228,7 @@ function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolea
   const [offerText, setOfferText] = useState('')
   const [answerInput, setAnswerInput] = useState('')
   const [pairCode, setPairCode] = useState('')
+  const [showManualHost, setShowManualHost] = useState(false)
 
   const [mode, setMode] = useState<'instant' | 'pattern'>('instant')
   const [durationMs, setDurationMs] = useState(2000)
@@ -461,48 +462,65 @@ function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolea
 
       {step !== 'connected' && (
         <section className="panel stack">
-          <h2>Manual signaling</h2>
+          <h2>Pairing</h2>
           <ol className="steps">
             <li>
-              <p>Generate an offer. Share the pair code with the guest. Blob copy/QR remains available as fallback.</p>
+              <p>Generate an offer and share the pair code with the guest (shortcode mode).</p>
               {step === 'idle' && (
                 <button type="button" className="btn btn-primary" disabled={busy} onClick={generateOffer}>
                   Generate offer
                 </button>
               )}
             </li>
-            {offerText && (
-              <li>
-                <p>Offer ({offerText.startsWith(SIGNALING_COMPACT_PREFIX) ? 'compact' : 'JSON'}) — {offerText.length} chars</p>
-                <div className="row wrap">
-                  <button
-                    type="button"
-                    className="btn"
-                    onClick={() => navigator.clipboard.writeText(offerText).catch(() => {})}
-                  >
-                    Copy offer
-                  </button>
-                  {offerText.length <= QR_SAFE_MAX_LEN ? (
-                    <div className="qr-box">
-                      <QRCodeSVG value={offerText} size={160} level="L" />
-                    </div>
-                  ) : (
-                    <p className="muted">Offer too large for QR ({offerText.length} chars). Use copy instead.</p>
-                  )}
-                </div>
-                <textarea className="input mono" readOnly rows={4} value={offerText} spellCheck={false} />
-              </li>
-            )}
             <li>
-              <p>Paste the answer from the GUEST (or wait for auto-fill from pair code), then connect.</p>
-              <textarea
-                className="input mono"
-                rows={6}
-                value={answerInput}
-                onChange={(e) => setAnswerInput(e.target.value)}
-                spellCheck={false}
-                placeholder={`${SIGNALING_COMPACT_PREFIX}... or paste JSON`}
-              />
+              <p>Wait for guest answer via shortcode (auto-fill), then connect.</p>
+              <button type="button" className="btn" onClick={() => setShowManualHost((v) => !v)}>
+                {showManualHost ? 'Hide manual blob/QR fallback' : 'Show manual blob/QR fallback'}
+              </button>
+              {showManualHost && offerText && (
+                <>
+                  <p>
+                    Offer ({offerText.startsWith(SIGNALING_COMPACT_PREFIX) ? 'compact' : 'JSON'}) — {offerText.length}{' '}
+                    chars
+                  </p>
+                  <div className="row wrap">
+                    <button
+                      type="button"
+                      className="btn"
+                      onClick={() => navigator.clipboard.writeText(offerText).catch(() => {})}
+                    >
+                      Copy offer
+                    </button>
+                    {offerText.length <= QR_SAFE_MAX_LEN ? (
+                      <div className="qr-box">
+                        <QRCodeSVG value={offerText} size={160} level="L" />
+                      </div>
+                    ) : (
+                      <p className="muted">Offer too large for QR ({offerText.length} chars). Use copy instead.</p>
+                    )}
+                  </div>
+                  <textarea className="input mono" readOnly rows={4} value={offerText} spellCheck={false} />
+                </>
+              )}
+              {showManualHost && (
+                <p className="muted">Manual mode: paste guest answer blob below if shortcode sync is unavailable.</p>
+              )}
+              {showManualHost ? (
+                <textarea
+                  className="input mono"
+                  rows={6}
+                  value={answerInput}
+                  onChange={(e) => setAnswerInput(e.target.value)}
+                  spellCheck={false}
+                  placeholder={`${SIGNALING_COMPACT_PREFIX}... or paste JSON`}
+                />
+              ) : (
+                <p className="muted">
+                  {answerInput
+                    ? 'Answer received from shortcode service and ready to apply.'
+                    : 'Waiting for guest answer via shortcode...'}
+                </p>
+              )}
               <button
                 type="button"
                 className="btn btn-primary"
@@ -659,6 +677,7 @@ function GuestFlow({ onBack, supported }: { onBack: () => void; supported: boole
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [connected, setConnected] = useState(false)
+  const [showManualGuest, setShowManualGuest] = useState(false)
   const [guestNetSnap, setGuestNetSnap] = useState<PeerNetSnapshot | null>(null)
   const pcRef = useRef<RTCPeerConnection | null>(null)
   const channelRef = useRef<RTCDataChannel | null>(null)
@@ -671,6 +690,7 @@ function GuestFlow({ onBack, supported }: { onBack: () => void; supported: boole
   const [playheadMs, setPlayheadMs] = useState(0)
   const playheadRaf = useRef<number | null>(null)
   const playAnchor = useRef<{ startAt: number; startPlayhead: number } | null>(null)
+  const hasPairCode = sessionInput.trim().length >= 6
 
   const clearGuestSched = () => {
     guestTimeouts.current.forEach((id) => window.clearTimeout(id))
@@ -833,39 +853,55 @@ function GuestFlow({ onBack, supported }: { onBack: () => void; supported: boole
             <span>HOST pair code (shortcode mode)</span>
             <input className="input" value={sessionInput} onChange={(e) => setSessionInput(e.target.value.toUpperCase())} maxLength={12} />
           </label>
-          <label className="field">
-            <span>Paste offer from HOST</span>
-            <textarea
-              className="input mono"
-              rows={6}
-              value={offerIn}
-              onChange={(e) => setOfferIn(e.target.value)}
-              spellCheck={false}
-              placeholder={`${SIGNALING_COMPACT_PREFIX}… or JSON`}
-            />
-          </label>
-          <button type="button" className="btn btn-primary" disabled={busy || !offerIn.trim()} onClick={createAnswer}>
+          <button type="button" className="btn" onClick={() => setShowManualGuest((v) => !v)}>
+            {showManualGuest ? 'Hide manual blob/QR fallback' : 'Show manual blob/QR fallback'}
+          </button>
+          {showManualGuest && (
+            <label className="field">
+              <span>Paste offer from HOST</span>
+              <textarea
+                className="input mono"
+                rows={6}
+                value={offerIn}
+                onChange={(e) => setOfferIn(e.target.value)}
+                spellCheck={false}
+                placeholder={`${SIGNALING_COMPACT_PREFIX}… or JSON`}
+              />
+            </label>
+          )}
+          <button
+            type="button"
+            className="btn btn-primary"
+            disabled={busy || (!offerIn.trim() && !hasPairCode)}
+            onClick={createAnswer}
+          >
             Create answer
           </button>
           {answerText && (
             <>
-              <p>
-                Send this answer to the HOST ({answerText.startsWith(SIGNALING_COMPACT_PREFIX) ? 'compact' : 'JSON'}) —{' '}
-                {answerText.length} chars (copy or QR).
-              </p>
-              <div className="row wrap">
-                <button type="button" className="btn" onClick={() => navigator.clipboard.writeText(answerText).catch(() => {})}>
-                  Copy answer
-                </button>
-                {answerText.length <= QR_SAFE_MAX_LEN ? (
-                  <div className="qr-box">
-                    <QRCodeSVG value={answerText} size={160} level="L" />
+              {!showManualGuest ? (
+                <p className="muted">Answer posted via shortcode. Wait for host to apply and connect.</p>
+              ) : (
+                <>
+                  <p>
+                    Send this answer to the HOST ({answerText.startsWith(SIGNALING_COMPACT_PREFIX) ? 'compact' : 'JSON'}) —{' '}
+                    {answerText.length} chars (copy or QR).
+                  </p>
+                  <div className="row wrap">
+                    <button type="button" className="btn" onClick={() => navigator.clipboard.writeText(answerText).catch(() => {})}>
+                      Copy answer
+                    </button>
+                    {answerText.length <= QR_SAFE_MAX_LEN ? (
+                      <div className="qr-box">
+                        <QRCodeSVG value={answerText} size={160} level="L" />
+                      </div>
+                    ) : (
+                      <p className="muted">Answer too large for QR. Use copy.</p>
+                    )}
                   </div>
-                ) : (
-                  <p className="muted">Answer too large for QR. Use copy.</p>
-                )}
-              </div>
-              <textarea className="input mono" readOnly rows={4} value={answerText} spellCheck={false} />
+                  <textarea className="input mono" readOnly rows={4} value={answerText} spellCheck={false} />
+                </>
+              )}
             </>
           )}
           {error && <p className="warn">{error}</p>}

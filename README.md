@@ -8,7 +8,7 @@ Live deployment: `https://boisterous-sundae-56358a.netlify.app`
 
 - `Device check`: best-effort device profile + haptics support probe.
 - `Haptics tester`: preset vibration patterns and custom pattern editing.
-- `Haptics pairing`: HOST/GUEST manual WebRTC signaling (compact blobs), instant mode, and pattern timeline mode.
+- `Haptics pairing`: HOST/GUEST shortcode signaling (8-char code), manual blob fallback, instant mode, and pattern timeline mode.
 
 ## Local development
 
@@ -31,6 +31,8 @@ This repo is configured for Netlify in `netlify.toml`.
 
 - `/api/turn/ice-config` -> Netlify Function `turn-ice-config`
 - `/api/turn/usage/:username` -> Netlify Function `turn-usage`
+- `/api/signal/session` -> Netlify Function `signal-session`
+- `/api/signal/state/:code` -> Netlify Function `signal-state`
 - everything else -> `/index.html` (SPA fallback)
 
 ## TURN relay via Metered (server-side only)
@@ -54,9 +56,11 @@ The frontend requests ICE config from `/api/turn/ice-config`. The function:
 
 - `POST /.netlify/functions/turn-ice-config` (or `/api/turn/ice-config` through redirect)
 - `GET /.netlify/functions/turn-usage/:username` (or `/api/turn/usage/:username`)
+- `POST /.netlify/functions/signal-session` (or `/api/signal/session`)
+- `GET/POST /.netlify/functions/signal-state/:code` (or `/api/signal/state/:code`)
 
 ## Notes
 
 - If the TURN function is unavailable, WebRTC falls back to STUN-only.
-- Pairing uses manual signaling blobs (compressed when available); the 8-character session code is a human label.
+- Pairing is shortcode-first (8-character code) with manual blob signaling as fallback.
 - Shortcode signaling uses Redis-backed state with 15-minute host/guest match TTL, then 12-hour active TTL after answer is posted.
