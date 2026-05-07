@@ -34,6 +34,7 @@ export type DcMessage =
     }
   | { v: 1; t: 'pause'; playheadMs: number }
   | { v: 1; t: 'sustain'; level: number }
+  | { v: 1; t: 'stopAll' }
   | { v: 1; t: 'disconnect' }
   | {
       v: 1
@@ -48,7 +49,7 @@ export type DcMessage =
   | {
       v: 1
       t: 'ack'
-      kind: 'instant' | 'patternState' | 'play' | 'pause' | 'sustain'
+      kind: 'instant' | 'patternState' | 'play' | 'pause' | 'sustain' | 'stopAll'
       at: number
       seq?: number
     }

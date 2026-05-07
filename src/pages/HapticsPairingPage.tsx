@@ -14,7 +14,7 @@ import {
   type DcMessage,
   type TimelineEvent,
 } from '../lib/webrtc'
-import { vibratePattern, vibrateSupported } from '../lib/vibrate'
+import { stopVibrate, vibratePattern, vibrateSupported } from '../lib/vibrate'
 
 type Role = 'pick' | 'host' | 'guest'
 
@@ -27,7 +27,7 @@ type PeerNetSnapshot = {
   dataChannel?: RTCDataChannelState
 }
 
-type HostAckKind = 'instant' | 'patternState' | 'play' | 'pause' | 'sustain'
+type HostAckKind = 'instant' | 'patternState' | 'play' | 'pause' | 'sustain' | 'stopAll'
 type DeliveryDot = {
   seq: number
   presetId: string
@@ -246,10 +246,12 @@ function PairingHeartbeatFooter({
   role,
   heartbeat,
   sessionStartedAt,
+  onStopAll,
 }: {
   role: 'host' | 'guest'
   heartbeat: GuestHeartbeat | null
   sessionStartedAt: number | null
+  onStopAll?: () => void
 }) {
   const [now, setNow] = useState(0)
   useEffect(() => {
@@ -272,6 +274,11 @@ function PairingHeartbeatFooter({
       <span>Session age: {sinceStart}</span>
       <span>Since last heartbeat: {sinceBeat}</span>
       <span>Locked: {heartbeat?.lockedMode ? 'ON' : 'OFF'}</span>
+      {role === 'host' && onStopAll && (
+        <button type="button" className="btn btn-danger" onClick={onStopAll}>
+          Stop all
+        </button>
+      )}
     </div>
   )
 }
@@ -554,6 +561,15 @@ function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolea
     const clamped = Math.max(0, Math.min(100, Math.round(nextLevel)))
     setSustainLevel(clamped)
     send({ v: 1, t: 'sustain', level: clamped })
+  }
+
+  const sendStopAll = () => {
+    clearLocalSched()
+    playAnchor.current = null
+    setPlaying(false)
+    setPlayheadMs(0)
+    setSustainLevel(0)
+    send({ v: 1, t: 'stopAll' })
   }
 
   const startPatternPlayback = () => {
@@ -900,7 +916,12 @@ function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolea
               </div>
             </section>
           )}
-          <PairingHeartbeatFooter role="host" heartbeat={guestHeartbeat} sessionStartedAt={hostSessionStartedAt} />
+          <PairingHeartbeatFooter
+            role="host"
+            heartbeat={guestHeartbeat}
+            sessionStartedAt={hostSessionStartedAt}
+            onStopAll={sendStopAll}
+          />
         </>
       )}
     </div>
@@ -927,6 +948,8 @@ function GuestFlow({ onBack, supported }: { onBack: () => void; supported: boole
   const [guestSessionStartedAt, setGuestSessionStartedAt] = useState<number | null>(null)
   const [guestLastHeartbeatAt, setGuestLastHeartbeatAt] = useState<number | null>(null)
   const [guestRecentTriggers30s, setGuestRecentTriggers30s] = useState(0)
+  const lastHostActivityAtRef = useRef<number | null>(null)
+  const [guestSafetyStopped, setGuestSafetyStopped] = useState(false)
   const [lastHapticExecution, setLastHapticExecution] = useState<{
     at: number
     success: boolean
@@ -951,6 +974,19 @@ function GuestFlow({ onBack, supported }: { onBack: () => void; supported: boole
     guestTimeouts.current.forEach((id) => window.clearTimeout(id))
     guestTimeouts.current = []
   }
+
+  const stopAllGuestActions = useCallback(() => {
+    clearGuestSched()
+    if (sustainTimerRef.current) window.clearInterval(sustainTimerRef.current)
+    sustainTimerRef.current = null
+    playAnchor.current = null
+    setPlaying(false)
+    setPlayheadMs(0)
+    setGuestSustainLevel(0)
+    guestSustainLevelRef.current = 0
+    stopVibrate()
+    setGuestSafetyStopped(true)
+  }, [])
 
   const endGuestConnection = useCallback((notifyHost: boolean) => {
     if (notifyHost) {
@@ -980,6 +1016,8 @@ function GuestFlow({ onBack, supported }: { onBack: () => void; supported: boole
     lastHeartbeatSentAtRef.current = null
     guestSustainLevelRef.current = 0
     guestLockedRef.current = false
+    lastHostActivityAtRef.current = null
+    setGuestSafetyStopped(false)
     guestSessionStartedAtRef.current = null
     guestTriggerTimesRef.current = []
   }, [])
@@ -1004,6 +1042,8 @@ function GuestFlow({ onBack, supported }: { onBack: () => void; supported: boole
         }
       }
       if (msg.t === 'instant') {
+        lastHostActivityAtRef.current = Date.now()
+        setGuestSafetyStopped(false)
         commandSinceHeartbeatRef.current = true
         setLastHostMessage({ kind: 'instant', at: Date.now() })
         sendAck('instant', msg.seq)
@@ -1017,6 +1057,8 @@ function GuestFlow({ onBack, supported }: { onBack: () => void; supported: boole
         return
       }
       if (msg.t === 'patternState') {
+        lastHostActivityAtRef.current = Date.now()
+        setGuestSafetyStopped(false)
         commandSinceHeartbeatRef.current = true
         setLastHostMessage({ kind: 'patternState', at: Date.now() })
         sendAck('patternState')
@@ -1028,6 +1070,8 @@ function GuestFlow({ onBack, supported }: { onBack: () => void; supported: boole
         return
       }
       if (msg.t === 'play') {
+        lastHostActivityAtRef.current = Date.now()
+        setGuestSafetyStopped(false)
         commandSinceHeartbeatRef.current = true
         setLastHostMessage({ kind: 'play', at: Date.now() })
         sendAck('play')
@@ -1055,6 +1099,8 @@ function GuestFlow({ onBack, supported }: { onBack: () => void; supported: boole
         return
       }
       if (msg.t === 'pause') {
+        lastHostActivityAtRef.current = Date.now()
+        setGuestSafetyStopped(false)
         commandSinceHeartbeatRef.current = true
         setLastHostMessage({ kind: 'pause', at: Date.now() })
         sendAck('pause')
@@ -1064,6 +1110,8 @@ function GuestFlow({ onBack, supported }: { onBack: () => void; supported: boole
         setPlayheadMs(msg.playheadMs)
       }
       if (msg.t === 'sustain') {
+        lastHostActivityAtRef.current = Date.now()
+        setGuestSafetyStopped(false)
         commandSinceHeartbeatRef.current = true
         setLastHostMessage({ kind: 'sustain', at: Date.now() })
         setGuestSustainLevel(msg.level)
@@ -1084,12 +1132,19 @@ function GuestFlow({ onBack, supported }: { onBack: () => void; supported: boole
           sustainTimerRef.current = window.setInterval(run, onMs + offMs)
         }
       }
+      if (msg.t === 'stopAll') {
+        lastHostActivityAtRef.current = Date.now()
+        stopAllGuestActions()
+        setLastHostMessage({ kind: 'stopAll', at: Date.now() })
+        sendAck('stopAll')
+      }
       if (msg.t === 'disconnect') {
+        lastHostActivityAtRef.current = Date.now()
         endGuestConnection(false)
         setError('Host ended the connection.')
       }
     },
-    [supported, endGuestConnection],
+    [supported, endGuestConnection, stopAllGuestActions],
   )
 
   useEffect(() => {
@@ -1123,6 +1178,7 @@ function GuestFlow({ onBack, supported }: { onBack: () => void; supported: boole
       guestSessionStartedAtRef.current = Date.now()
       setGuestSessionStartedAt(guestSessionStartedAtRef.current)
     }
+    if (!lastHostActivityAtRef.current) lastHostActivityAtRef.current = Date.now()
     const sendHeartbeat = () => {
       const ch = channelRef.current
       if (!ch || ch.readyState !== 'open') return
@@ -1156,6 +1212,20 @@ function GuestFlow({ onBack, supported }: { onBack: () => void; supported: boole
   }, [connected])
 
   useEffect(() => {
+    if (!connected) return
+    const WATCHDOG_MS = 12_000
+    const timer = window.setInterval(() => {
+      const last = lastHostActivityAtRef.current
+      if (!last) return
+      if (Date.now() - last > WATCHDOG_MS && !guestSafetyStopped) {
+        stopAllGuestActions()
+        setError('Safety stop: host connection lost; haptics halted.')
+      }
+    }, 1000)
+    return () => window.clearInterval(timer)
+  }, [connected, guestSafetyStopped, stopAllGuestActions])
+
+  useEffect(() => {
     guestSustainLevelRef.current = guestSustainLevel
   }, [guestSustainLevel])
 
@@ -1186,11 +1256,15 @@ function GuestFlow({ onBack, supported }: { onBack: () => void; supported: boole
       }
 
       const pushGuestNet = () => {
-        setGuestNetSnap({
+        const snap = {
           ice: pc.iceConnectionState,
           connection: pc.connectionState,
           dataChannel: channelRef.current?.readyState,
-        })
+        } as const
+        setGuestNetSnap(snap)
+        if (snap.connection === 'failed' || snap.connection === 'disconnected' || snap.connection === 'closed') {
+          stopAllGuestActions()
+        }
       }
       pc.addEventListener('iceconnectionstatechange', pushGuestNet)
       pc.addEventListener('connectionstatechange', pushGuestNet)
@@ -1200,13 +1274,23 @@ function GuestFlow({ onBack, supported }: { onBack: () => void; supported: boole
       channelRef.current = ch
       ch.addEventListener('open', () => {
         pushGuestNet()
+        lastHostActivityAtRef.current = Date.now()
+        setGuestSafetyStopped(false)
         setConnected(true)
+      })
+      ch.addEventListener('closing', () => {
+        stopAllGuestActions()
+      })
+      ch.addEventListener('close', () => {
+        stopAllGuestActions()
       })
       ch.addEventListener('closing', pushGuestNet)
       pushGuestNet()
       ch.onmessage = (ev) => handleDcMessage(typeof ev.data === 'string' ? ev.data : '')
       if (ch.readyState === 'open') {
         pushGuestNet()
+        lastHostActivityAtRef.current = Date.now()
+        setGuestSafetyStopped(false)
         setConnected(true)
       }
     } catch (e) {
