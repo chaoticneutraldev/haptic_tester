@@ -78,6 +78,10 @@ The frontend requests ICE config from `/api/turn/ice-config`. The function:
 - `POST /.netlify/functions/signal-session` (or `/api/signal/session`)
 - `GET/POST /.netlify/functions/signal-state/:code` (or `/api/signal/state/:code`)
 
+## iOS: Ad Hoc native receiver (optional)
+
+Safari cannot expose reliable physical haptics for arbitrary web patterns. For a **small beta** (e.g. **4 UDIDs**) without a public App Store listing, see **[ios/ADHOC-DISTRIBUTION.md](./ios/ADHOC-DISTRIBUTION.md)** — register devices, archive an Ad Hoc **IPA**, and install on those phones. Overview: **[ios/README.md](./ios/README.md)**.
+
 ## Notes
 
 - If the TURN function is unavailable, WebRTC falls back to STUN-only.
