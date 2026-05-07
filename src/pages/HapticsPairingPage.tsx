@@ -34,6 +34,13 @@ type DeliveryDot = {
   status: 'sent' | 'ack' | 'timeout'
 }
 
+type HostPatternConfig = {
+  id: string
+  name: string
+  durationMs: number
+  events: TimelineEvent[]
+}
+
 type GuestHeartbeat = {
   sentAt: number
   sessionStartedAt: number
@@ -229,6 +236,12 @@ function GuestSignalingProgress({
   )
 }
 
+const HOST_PATTERN_PRESETS: HostPatternConfig[] = [
+  { id: 'pattern-a', name: 'Pattern A', durationMs: 2000, events: [] },
+  { id: 'pattern-b', name: 'Pattern B', durationMs: 3000, events: [] },
+  { id: 'pattern-c', name: 'Pattern C', durationMs: 4000, events: [] },
+]
+
 function PairingHeartbeatFooter({
   role,
   heartbeat,
@@ -281,15 +294,22 @@ function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolea
   const [lastGuestAck, setLastGuestAck] = useState<{ kind: HostAckKind; at: number } | null>(null)
 
   const [mode, setMode] = useState<'instant' | 'pattern' | 'sustained'>('instant')
-  const [durationMs, setDurationMs] = useState(2000)
-  const [events, setEvents] = useState<TimelineEvent[]>([])
+  const [patterns, setPatterns] = useState<HostPatternConfig[]>(HOST_PATTERN_PRESETS)
+  const [activePatternId, setActivePatternId] = useState(HOST_PATTERN_PRESETS[0]?.id ?? 'pattern-a')
   const [playing, setPlaying] = useState(false)
+  const [loopMode, setLoopMode] = useState(false)
   const [playheadMs, setPlayheadMs] = useState(0)
   const [sustainLevel, setSustainLevel] = useState(0)
   const [deliveryDots, setDeliveryDots] = useState<DeliveryDot[]>([])
   const seqRef = useRef(1)
   const [guestHeartbeat, setGuestHeartbeat] = useState<GuestHeartbeat | null>(null)
   const [hostSessionStartedAt, setHostSessionStartedAt] = useState<number | null>(null)
+  const activePattern = useMemo(
+    () => patterns.find((p) => p.id === activePatternId) ?? patterns[0] ?? HOST_PATTERN_PRESETS[0],
+    [patterns, activePatternId],
+  )
+  const durationMs = activePattern.durationMs
+  const events = activePattern.events
   const playheadRaf = useRef<number | null>(null)
   const playAnchor = useRef<{ startAt: number; startPlayhead: number } | null>(null)
   const localTimeouts = useRef<number[]>([])
@@ -328,6 +348,34 @@ function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolea
     [send, clearLocalSched],
   )
 
+  const updateActivePattern = useCallback(
+    (updater: (p: HostPatternConfig) => HostPatternConfig) => {
+      setPatterns((prev) => prev.map((p) => (p.id === activePatternId ? updater(p) : p)))
+    },
+    [activePatternId],
+  )
+
+  const schedulePatternCycle = useCallback(
+    (initial: number) => {
+      clearLocalSched()
+      const startAt = Date.now() + 180
+      playAnchor.current = { startAt, startPlayhead: initial }
+      send({ v: 1, t: 'play', startAt, durationMs, events, initialPlayheadMs: initial })
+
+      const now = Date.now()
+      const delay0 = Math.max(0, startAt - now)
+      for (const ev of events) {
+        if (ev.offsetMs < initial) continue
+        const t = window.setTimeout(() => {
+          const p = getPresetById(ev.presetId)
+          if (p) vibratePattern(p.pattern)
+        }, delay0 + (ev.offsetMs - initial))
+        localTimeouts.current.push(t)
+      }
+    },
+    [clearLocalSched, send, durationMs, events],
+  )
+
   const broadcastPatternState = useCallback(
     (overrides?: Partial<{ playing: boolean; playheadMs: number }>) => {
       send({
@@ -343,7 +391,7 @@ function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolea
   )
 
   useEffect(() => {
-    if (step !== 'connected' || mode !== 'pattern') return
+    if (step !== 'connected') return
     if (!playing) {
       if (playheadRaf.current) cancelAnimationFrame(playheadRaf.current)
       playheadRaf.current = null
@@ -356,6 +404,12 @@ function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolea
       const next = Math.min(durationMs, anchor.startPlayhead + elapsed)
       setPlayheadMs(next)
       if (next >= durationMs) {
+        if (loopMode) {
+          setPlayheadMs(0)
+          schedulePatternCycle(0)
+          playheadRaf.current = requestAnimationFrame(loop)
+          return
+        }
         setPlaying(false)
         playAnchor.current = null
         send({ v: 1, t: 'pause', playheadMs: durationMs })
@@ -368,13 +422,13 @@ function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolea
     return () => {
       if (playheadRaf.current) cancelAnimationFrame(playheadRaf.current)
     }
-  }, [playing, step, mode, durationMs, send, broadcastPatternState])
+  }, [playing, step, durationMs, send, broadcastPatternState, loopMode, schedulePatternCycle])
 
   useEffect(() => {
-    if (step !== 'connected' || mode !== 'pattern') return
+    if (step !== 'connected') return
     if (playing) return
     broadcastPatternState()
-  }, [events, durationMs, step, mode, playing, broadcastPatternState, playheadMs])
+  }, [events, durationMs, step, playing, broadcastPatternState, playheadMs])
 
   const generateOffer = async () => {
     setError(null)
@@ -503,23 +557,8 @@ function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolea
   }
 
   const startPatternPlayback = () => {
-    clearLocalSched()
-    const startAt = Date.now() + 180
-    const initial = playheadMs
-    playAnchor.current = { startAt, startPlayhead: initial }
     setPlaying(true)
-    send({ v: 1, t: 'play', startAt, durationMs, events, initialPlayheadMs: initial })
-
-    const now = Date.now()
-    const delay0 = Math.max(0, startAt - now)
-    for (const ev of events) {
-      if (ev.offsetMs < initial) continue
-      const t = window.setTimeout(() => {
-        const p = getPresetById(ev.presetId)
-        if (p) vibratePattern(p.pattern)
-      }, delay0 + (ev.offsetMs - initial))
-      localTimeouts.current.push(t)
-    }
+    schedulePatternCycle(playheadMs)
   }
 
   const pausePatternPlayback = () => {
@@ -531,15 +570,25 @@ function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolea
   }
 
   const adjustDuration = (delta: number) => {
-    setDurationMs((d) => Math.min(16000, Math.max(1000, d + delta)))
+    updateActivePattern((p) => ({
+      ...p,
+      durationMs: Math.min(16000, Math.max(1000, p.durationMs + delta)),
+    }))
+    setPlayheadMs((p) => Math.min(Math.max(0, p), Math.min(16000, Math.max(1000, durationMs + delta))))
   }
 
   const addEventAtPlayhead = (presetId: string) => {
-    setEvents((ev) => [...ev, newEvent(quantize(playheadMs), presetId)])
+    updateActivePattern((p) => ({
+      ...p,
+      events: [...p.events, newEvent(quantize(playheadMs), presetId)],
+    }))
   }
 
   const removeEvent = (id: string) => {
-    setEvents((ev) => ev.filter((e) => e.id !== id))
+    updateActivePattern((p) => ({
+      ...p,
+      events: p.events.filter((e) => e.id !== id),
+    }))
   }
 
   const onTimelineClick = (e: React.MouseEvent<HTMLDivElement>) => {
@@ -701,8 +750,26 @@ function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolea
             <section className="panel stack">
               <h2>Pattern timeline</h2>
               <p className="muted">
-                Sheet-style timeline: add haptic “notes”, extend length, play/pause. Guests see updates but cannot edit.
+                Switch between saved pattern slots below. Each pattern keeps its own timeline and duration. Loop mode is
+                global and applies to whichever pattern is active.
               </p>
+              <div className="row wrap">
+                {patterns.map((p) => (
+                  <button
+                    key={p.id}
+                    type="button"
+                    className={`btn ${p.id === activePatternId ? 'btn-primary' : ''}`}
+                    disabled={playing}
+                    onClick={() => {
+                      setActivePatternId(p.id)
+                      setPlayheadMs(0)
+                    }}
+                  >
+                    {p.name}
+                  </button>
+                ))}
+                {playing && <span className="muted">Pause to switch patterns.</span>}
+              </div>
               <div className="row wrap">
                 <button type="button" className="btn" onClick={() => adjustDuration(-1000)} disabled={durationMs <= 1000}>
                   −1s
@@ -713,6 +780,10 @@ function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolea
                 <span className="pill">
                   Length {(durationMs / 1000).toFixed(0)}s (1–16s)
                 </span>
+                <label className="field inline">
+                  <span>Loop mode</span>
+                  <input type="checkbox" checked={loopMode} onChange={(e) => setLoopMode(e.target.checked)} />
+                </label>
                 {!playing ? (
                   <button type="button" className="btn btn-primary" onClick={startPatternPlayback}>
                     Play
