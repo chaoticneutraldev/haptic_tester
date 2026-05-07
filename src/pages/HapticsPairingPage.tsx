@@ -27,6 +27,13 @@ type PeerNetSnapshot = {
   dataChannel?: RTCDataChannelState
 }
 
+type HostAckKind = 'instant' | 'patternState' | 'play' | 'pause' | 'sustain'
+type DeliveryDot = {
+  seq: number
+  presetId: string
+  status: 'sent' | 'ack' | 'timeout'
+}
+
 function IcePathPanel({ snap, context }: { snap: PeerNetSnapshot | null; context: 'host' | 'guest' }) {
   if (!snap) return null
   const iceFailed = snap.ice === 'failed'
@@ -229,13 +236,16 @@ function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolea
   const [answerInput, setAnswerInput] = useState('')
   const [pairCode, setPairCode] = useState('')
   const [showManualHost, setShowManualHost] = useState(false)
-  const [lastGuestAck, setLastGuestAck] = useState<{ kind: 'instant' | 'patternState' | 'play' | 'pause'; at: number } | null>(null)
+  const [lastGuestAck, setLastGuestAck] = useState<{ kind: HostAckKind; at: number } | null>(null)
 
-  const [mode, setMode] = useState<'instant' | 'pattern'>('instant')
+  const [mode, setMode] = useState<'instant' | 'pattern' | 'sustained'>('instant')
   const [durationMs, setDurationMs] = useState(2000)
   const [events, setEvents] = useState<TimelineEvent[]>([])
   const [playing, setPlaying] = useState(false)
   const [playheadMs, setPlayheadMs] = useState(0)
+  const [sustainLevel, setSustainLevel] = useState(0)
+  const [deliveryDots, setDeliveryDots] = useState<DeliveryDot[]>([])
+  const seqRef = useRef(1)
   const playheadRaf = useRef<number | null>(null)
   const playAnchor = useRef<{ startAt: number; startPlayhead: number } | null>(null)
   const localTimeouts = useRef<number[]>([])
@@ -318,6 +328,9 @@ function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolea
         const msg = parseDcMessage(typeof ev.data === 'string' ? ev.data : '')
         if (msg?.t === 'ack') {
           setLastGuestAck({ kind: msg.kind, at: msg.at })
+          if (msg.kind === 'instant' && typeof msg.seq === 'number') {
+            setDeliveryDots((prev) => prev.map((d) => (d.seq === msg.seq ? { ...d, status: 'ack' } : d)))
+          }
         }
       }
       const pushHostNet = () => {
@@ -390,7 +403,18 @@ function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolea
   const playInstant = (presetId: string) => {
     const p = getPresetById(presetId)
     if (p) vibratePattern(p.pattern)
-    send({ v: 1, t: 'instant', presetId })
+    const seq = seqRef.current++
+    setDeliveryDots((prev) => [...prev, { seq, presetId, status: 'sent' as const }].slice(-20))
+    window.setTimeout(() => {
+      setDeliveryDots((prev) => prev.map((d) => (d.seq === seq && d.status === 'sent' ? { ...d, status: 'timeout' } : d)))
+    }, 4000)
+    send({ v: 1, t: 'instant', presetId, seq })
+  }
+
+  const sendSustainLevel = (nextLevel: number) => {
+    const clamped = Math.max(0, Math.min(100, Math.round(nextLevel)))
+    setSustainLevel(clamped)
+    send({ v: 1, t: 'sustain', level: clamped })
   }
 
   const startPatternPlayback = () => {
@@ -550,13 +574,21 @@ function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolea
               ? `${lastGuestAck.kind} @ ${new Date(lastGuestAck.at).toLocaleTimeString()}`
               : 'none yet (send a test action)'}
           </p>
+          <div className="delivery-dots" aria-label="Last 20 host haptic sends">
+            {Array.from({ length: 20 }).map((_, idx) => {
+              const dot = deliveryDots[idx]
+              const cls = dot ? `delivery-dot delivery-dot--${dot.status}` : 'delivery-dot delivery-dot--idle'
+              return <span key={idx} className={cls} title={dot ? `${dot.presetId} #${dot.seq} ${dot.status}` : 'idle'} />
+            })}
+          </div>
 
           <div className="panel row wrap">
             <label className="toggle">
               <span>Mode</span>
-              <select value={mode} onChange={(e) => setMode(e.target.value as 'instant' | 'pattern')}>
+              <select value={mode} onChange={(e) => setMode(e.target.value as 'instant' | 'pattern' | 'sustained')}>
                 <option value="instant">Instant</option>
                 <option value="pattern">Pattern</option>
+                <option value="sustained">Sustained</option>
               </select>
             </label>
           </div>
@@ -673,6 +705,40 @@ function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolea
               </ul>
             </section>
           )}
+          {mode === 'sustained' && (
+            <section className="panel stack">
+              <h2>Sustained buzz</h2>
+              <p className="muted">Set a continuous buzz level on GUEST (0 = off, 100 = strongest emulation).</p>
+              <div className="row wrap">
+                <button type="button" className="btn" onClick={() => sendSustainLevel(sustainLevel - 10)}>
+                  -10
+                </button>
+                <input
+                  type="range"
+                  min={0}
+                  max={100}
+                  step={1}
+                  value={sustainLevel}
+                  onChange={(e) => sendSustainLevel(Number(e.target.value))}
+                />
+                <button type="button" className="btn" onClick={() => sendSustainLevel(sustainLevel + 10)}>
+                  +10
+                </button>
+                <span className="pill">Level {sustainLevel}</span>
+              </div>
+              <div className="row wrap">
+                <button type="button" className="btn" onClick={() => sendSustainLevel(0)}>
+                  Stop
+                </button>
+                <button type="button" className="btn btn-primary" onClick={() => sendSustainLevel(60)}>
+                  Medium
+                </button>
+                <button type="button" className="btn" onClick={() => sendSustainLevel(90)}>
+                  Strong
+                </button>
+              </div>
+            </section>
+          )}
         </>
       )}
     </div>
@@ -687,7 +753,9 @@ function GuestFlow({ onBack, supported }: { onBack: () => void; supported: boole
   const [error, setError] = useState<string | null>(null)
   const [connected, setConnected] = useState(false)
   const [showManualGuest, setShowManualGuest] = useState(false)
-  const [lastHostMessage, setLastHostMessage] = useState<{ kind: 'instant' | 'patternState' | 'play' | 'pause'; at: number } | null>(null)
+  const [lastHostMessage, setLastHostMessage] = useState<{ kind: HostAckKind; at: number } | null>(null)
+  const [guestSustainLevel, setGuestSustainLevel] = useState(0)
+  const sustainTimerRef = useRef<number | null>(null)
   const [lastHapticExecution, setLastHapticExecution] = useState<{
     at: number
     success: boolean
@@ -715,6 +783,8 @@ function GuestFlow({ onBack, supported }: { onBack: () => void; supported: boole
   useEffect(() => {
     return () => {
       clearGuestSched()
+      if (sustainTimerRef.current) window.clearInterval(sustainTimerRef.current)
+      sustainTimerRef.current = null
       pcRef.current?.close()
     }
   }, [])
@@ -723,15 +793,15 @@ function GuestFlow({ onBack, supported }: { onBack: () => void; supported: boole
     (raw: string) => {
       const msg = parseDcMessage(raw)
       if (!msg) return
-      const sendAck = (kind: 'instant' | 'patternState' | 'play' | 'pause') => {
+      const sendAck = (kind: HostAckKind, seq?: number) => {
         const ch = channelRef.current
         if (ch && ch.readyState === 'open') {
-          ch.send(stringifyDcMessage({ v: 1, t: 'ack', kind, at: Date.now() }))
+          ch.send(stringifyDcMessage({ v: 1, t: 'ack', kind, at: Date.now(), ...(typeof seq === 'number' ? { seq } : {}) }))
         }
       }
       if (msg.t === 'instant') {
         setLastHostMessage({ kind: 'instant', at: Date.now() })
-        sendAck('instant')
+        sendAck('instant', msg.seq)
         const p = getPresetById(msg.presetId)
         if (p && supported) {
           const ok = vibratePattern(p.pattern)
@@ -780,6 +850,25 @@ function GuestFlow({ onBack, supported }: { onBack: () => void; supported: boole
         playAnchor.current = null
         setPlaying(false)
         setPlayheadMs(msg.playheadMs)
+      }
+      if (msg.t === 'sustain') {
+        setLastHostMessage({ kind: 'sustain', at: Date.now() })
+        setGuestSustainLevel(msg.level)
+        sendAck('sustain')
+        if (sustainTimerRef.current) {
+          window.clearInterval(sustainTimerRef.current)
+          sustainTimerRef.current = null
+        }
+        if (msg.level > 0 && supported) {
+          const onMs = Math.max(20, Math.round((msg.level / 100) * 240))
+          const offMs = Math.max(35, 180 - Math.round((msg.level / 100) * 120))
+          const run = () => {
+            const ok = vibratePattern([onMs, offMs])
+            setLastHapticExecution({ at: Date.now(), success: ok, reason: 'remote' })
+          }
+          run()
+          sustainTimerRef.current = window.setInterval(run, onMs + offMs)
+        }
       }
     },
     [supported],
@@ -979,6 +1068,7 @@ function GuestFlow({ onBack, supported }: { onBack: () => void; supported: boole
               ? `${lastHostMessage.kind} @ ${new Date(lastHostMessage.at).toLocaleTimeString()}`
               : 'none yet'}
           </p>
+          {lastHostMessage?.kind === 'sustain' && <p className="muted">Current sustained level: {guestSustainLevel}</p>}
           {!supported && <p className="warn">Vibration API not available—patterns will not be felt here.</p>}
           {modeView === 'instant' && <p className="muted">Waiting for instant taps from the host…</p>}
           {modeView === 'pattern' && (

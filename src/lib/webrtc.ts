@@ -14,7 +14,7 @@ export type TimelineEvent = {
 }
 
 export type DcMessage =
-  | { v: 1; t: 'instant'; presetId: string }
+  | { v: 1; t: 'instant'; presetId: string; seq: number }
   | {
       v: 1
       t: 'patternState'
@@ -33,7 +33,14 @@ export type DcMessage =
       initialPlayheadMs: number
     }
   | { v: 1; t: 'pause'; playheadMs: number }
-  | { v: 1; t: 'ack'; kind: 'instant' | 'patternState' | 'play' | 'pause'; at: number }
+  | { v: 1; t: 'sustain'; level: number }
+  | {
+      v: 1
+      t: 'ack'
+      kind: 'instant' | 'patternState' | 'play' | 'pause' | 'sustain'
+      at: number
+      seq?: number
+    }
 
 export async function createPeerConnection(label?: string): Promise<RTCPeerConnection> {
   let iceServers: RTCIceServer[]

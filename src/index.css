@@ -548,6 +548,37 @@ textarea.input {
   font-size: 0.85em;
 }
 
+.delivery-dots {
+  display: grid;
+  grid-template-columns: repeat(20, 10px);
+  gap: 6px;
+  align-items: center;
+  margin: 0.25rem 0 0.5rem;
+}
+
+.delivery-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 999px;
+  background: var(--border);
+  border: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
+}
+
+.delivery-dot--sent {
+  background: #facc15;
+  border-color: #eab308;
+}
+
+.delivery-dot--ack {
+  background: #22c55e;
+  border-color: #16a34a;
+}
+
+.delivery-dot--timeout {
+  background: #ef4444;
+  border-color: #dc2626;
+}
+
 code {
   font-family: var(--mono);
   font-size: 0.9em;
