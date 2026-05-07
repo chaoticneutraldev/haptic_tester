@@ -8,6 +8,15 @@ function json(statusCode, body) {
   }
 }
 
+function normalizeMeteredAppName(input) {
+  const raw = String(input ?? '').trim().toLowerCase()
+  if (!raw) return ''
+  return raw
+    .replace(/^https?:\/\//, '')
+    .replace(/\/+$/, '')
+    .replace(/\.metered\.live$/, '')
+}
+
 async function meteredFetch(base, path) {
   const res = await fetch(`${base}${path}`)
   const text = await res.text()
@@ -31,7 +40,7 @@ export async function handler(event) {
     return json(405, { error: 'Method not allowed' })
   }
 
-  const appName = process.env.METERED_APP_NAME
+  const appName = normalizeMeteredAppName(process.env.METERED_APP_NAME)
   const secretKey = process.env.METERED_SECRET_KEY
   if (!appName || !secretKey) {
     return json(500, {
