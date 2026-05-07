@@ -134,7 +134,7 @@ h3 {
 
 .app-main {
   flex: 1;
-  padding: 1.25rem 0;
+  padding: 1.25rem 0 4.5rem;
 }
 
 .app-footer {
@@ -212,6 +212,16 @@ h3 {
 
 .btn-primary:hover:not(:disabled) {
   filter: brightness(1.05);
+}
+
+.btn-danger {
+  background: #b91c1c;
+  color: #fff;
+  border-color: transparent;
+}
+
+.btn-danger:hover:not(:disabled) {
+  filter: brightness(1.06);
 }
 
 .btn-ghost {
@@ -577,6 +587,45 @@ textarea.input {
 .delivery-dot--timeout {
   background: #ef4444;
   border-color: #dc2626;
+}
+
+.guest-locked-mode {
+  position: relative;
+}
+
+.guest-lock-overlay {
+  position: absolute;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.82);
+  border-radius: 0.75rem;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0.75rem;
+  z-index: 30;
+  color: #fff;
+  text-align: center;
+  padding: 1rem;
+  pointer-events: auto;
+}
+
+.pairing-footer {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 40;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem 1rem;
+  align-items: center;
+  justify-content: center;
+  padding: 0.6rem 0.9rem;
+  font-size: 0.82rem;
+  border-top: 1px solid var(--border);
+  background: color-mix(in srgb, var(--surface) 92%, var(--bg));
+  backdrop-filter: blur(6px);
 }
 
 code {

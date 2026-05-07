@@ -34,6 +34,14 @@ type DeliveryDot = {
   status: 'sent' | 'ack' | 'timeout'
 }
 
+type GuestHeartbeat = {
+  sentAt: number
+  sessionStartedAt: number
+  sustainedLevel: number
+  recentTriggers30s: number
+  lockedMode: boolean
+}
+
 function IcePathPanel({ snap, context }: { snap: PeerNetSnapshot | null; context: 'host' | 'guest' }) {
   if (!snap) return null
   const iceFailed = snap.ice === 'failed'
@@ -221,6 +229,40 @@ function GuestSignalingProgress({
   )
 }
 
+function PairingHeartbeatFooter({
+  role,
+  heartbeat,
+  sessionStartedAt,
+}: {
+  role: 'host' | 'guest'
+  heartbeat: GuestHeartbeat | null
+  sessionStartedAt: number | null
+}) {
+  const [now, setNow] = useState(0)
+  useEffect(() => {
+    const t = window.setInterval(() => setNow(Date.now()), 1000)
+    return () => window.clearInterval(t)
+  }, [])
+
+  const fmt = (ms: number) => `${Math.max(0, Math.floor(ms / 1000))}s`
+  const started = heartbeat?.sessionStartedAt ?? sessionStartedAt
+  const sinceStart = started ? fmt(now - started) : 'n/a'
+  const sinceBeat = heartbeat ? fmt(now - heartbeat.sentAt) : 'n/a'
+
+  return (
+    <div className="pairing-footer">
+      <span>
+        <strong>Heartbeat ({role})</strong>
+      </span>
+      <span>Sustain: {heartbeat?.sustainedLevel ?? 0}</span>
+      <span>30s triggers: {heartbeat?.recentTriggers30s ?? 0}</span>
+      <span>Session age: {sinceStart}</span>
+      <span>Since last heartbeat: {sinceBeat}</span>
+      <span>Locked: {heartbeat?.lockedMode ? 'ON' : 'OFF'}</span>
+    </div>
+  )
+}
+
 function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolean }) {
   const sessionId = useMemo(() => generateSessionId(), [])
   const [step, setStep] = useState<HostStep>('idle')
@@ -246,6 +288,8 @@ function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolea
   const [sustainLevel, setSustainLevel] = useState(0)
   const [deliveryDots, setDeliveryDots] = useState<DeliveryDot[]>([])
   const seqRef = useRef(1)
+  const [guestHeartbeat, setGuestHeartbeat] = useState<GuestHeartbeat | null>(null)
+  const [hostSessionStartedAt, setHostSessionStartedAt] = useState<number | null>(null)
   const playheadRaf = useRef<number | null>(null)
   const playAnchor = useRef<{ startAt: number; startPlayhead: number } | null>(null)
   const localTimeouts = useRef<number[]>([])
@@ -259,6 +303,30 @@ function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolea
     localTimeouts.current.forEach((id) => window.clearTimeout(id))
     localTimeouts.current = []
   }, [])
+
+  const endConnection = useCallback(
+    (notifyGuest: boolean) => {
+      if (notifyGuest) send({ v: 1, t: 'disconnect' })
+      clearLocalSched()
+      pcRef.current?.close()
+      channelRef.current?.close()
+      pcRef.current = null
+      channelRef.current = null
+      setStep('idle')
+      setHostHandoff(false)
+      setHostNetSnap(null)
+      setPairCode('')
+      setOfferText('')
+      setAnswerInput('')
+      setLastGuestAck(null)
+      setDeliveryDots([])
+      setSustainLevel(0)
+      setGuestHeartbeat(null)
+      setHostSessionStartedAt(null)
+      setError(null)
+    },
+    [send, clearLocalSched],
+  )
 
   const broadcastPatternState = useCallback(
     (overrides?: Partial<{ playing: boolean; playheadMs: number }>) => {
@@ -326,6 +394,21 @@ function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolea
       channelRef.current = channel
       channel.onmessage = (ev) => {
         const msg = parseDcMessage(typeof ev.data === 'string' ? ev.data : '')
+        if (msg?.t === 'disconnect') {
+          endConnection(false)
+          setError('Guest ended the connection.')
+          return
+        }
+        if (msg?.t === 'heartbeat') {
+          setGuestHeartbeat({
+            sentAt: msg.sentAt,
+            sessionStartedAt: msg.sessionStartedAt,
+            sustainedLevel: msg.sustainedLevel,
+            recentTriggers30s: msg.recentTriggers30s,
+            lockedMode: msg.lockedMode,
+          })
+          return
+        }
         if (msg?.t === 'ack') {
           setLastGuestAck({ kind: msg.kind, at: msg.at })
           if (msg.kind === 'instant' && typeof msg.seq === 'number') {
@@ -351,10 +434,12 @@ function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolea
       setStep('offer-ready')
       channel.onopen = () => {
         pushHostNet()
+        setHostSessionStartedAt(Date.now())
         setHostHandoff(false)
         setStep('connected')
       }
       if (channel.readyState === 'open') {
+        setHostSessionStartedAt(Date.now())
         setHostHandoff(false)
         setStep('connected')
       }
@@ -568,6 +653,11 @@ function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolea
       {step === 'connected' && (
         <>
           <p className="ok">Data channel open. Use the panel below; the guest device will mirror pattern view.</p>
+          <div className="row wrap">
+            <button type="button" className="btn btn-danger" onClick={() => endConnection(true)}>
+              End connection
+            </button>
+          </div>
           <p className="muted">
             Guest delivery ack:{' '}
             {lastGuestAck
@@ -739,6 +829,7 @@ function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolea
               </div>
             </section>
           )}
+          <PairingHeartbeatFooter role="host" heartbeat={guestHeartbeat} sessionStartedAt={hostSessionStartedAt} />
         </>
       )}
     </div>
@@ -756,6 +847,15 @@ function GuestFlow({ onBack, supported }: { onBack: () => void; supported: boole
   const [lastHostMessage, setLastHostMessage] = useState<{ kind: HostAckKind; at: number } | null>(null)
   const [guestSustainLevel, setGuestSustainLevel] = useState(0)
   const sustainTimerRef = useRef<number | null>(null)
+  const guestTriggerTimesRef = useRef<number[]>([])
+  const guestSessionStartedAtRef = useRef<number | null>(null)
+  const guestSustainLevelRef = useRef(0)
+  const guestLockedRef = useRef(false)
+  const commandSinceHeartbeatRef = useRef(false)
+  const lastHeartbeatSentAtRef = useRef<number | null>(null)
+  const [guestSessionStartedAt, setGuestSessionStartedAt] = useState<number | null>(null)
+  const [guestLastHeartbeatAt, setGuestLastHeartbeatAt] = useState<number | null>(null)
+  const [guestRecentTriggers30s, setGuestRecentTriggers30s] = useState(0)
   const [lastHapticExecution, setLastHapticExecution] = useState<{
     at: number
     success: boolean
@@ -774,11 +874,44 @@ function GuestFlow({ onBack, supported }: { onBack: () => void; supported: boole
   const playheadRaf = useRef<number | null>(null)
   const playAnchor = useRef<{ startAt: number; startPlayhead: number } | null>(null)
   const hasPairCode = sessionInput.trim().length >= 5
+  const [guestLocked, setGuestLocked] = useState(false)
 
   const clearGuestSched = () => {
     guestTimeouts.current.forEach((id) => window.clearTimeout(id))
     guestTimeouts.current = []
   }
+
+  const endGuestConnection = useCallback((notifyHost: boolean) => {
+    if (notifyHost) {
+      const ch = channelRef.current
+      if (ch && ch.readyState === 'open') {
+        ch.send(stringifyDcMessage({ v: 1, t: 'disconnect' }))
+      }
+    }
+    clearGuestSched()
+    if (sustainTimerRef.current) window.clearInterval(sustainTimerRef.current)
+    sustainTimerRef.current = null
+    pcRef.current?.close()
+    channelRef.current?.close()
+    pcRef.current = null
+    channelRef.current = null
+    setConnected(false)
+    setGuestNetSnap(null)
+    setAnswerText('')
+    setOfferIn('')
+    setLastHostMessage(null)
+    setGuestSustainLevel(0)
+    setGuestLocked(false)
+    setGuestLastHeartbeatAt(null)
+    setGuestRecentTriggers30s(0)
+    setGuestSessionStartedAt(null)
+    commandSinceHeartbeatRef.current = false
+    lastHeartbeatSentAtRef.current = null
+    guestSustainLevelRef.current = 0
+    guestLockedRef.current = false
+    guestSessionStartedAtRef.current = null
+    guestTriggerTimesRef.current = []
+  }, [])
 
   useEffect(() => {
     return () => {
@@ -800,8 +933,11 @@ function GuestFlow({ onBack, supported }: { onBack: () => void; supported: boole
         }
       }
       if (msg.t === 'instant') {
+        commandSinceHeartbeatRef.current = true
         setLastHostMessage({ kind: 'instant', at: Date.now() })
         sendAck('instant', msg.seq)
+        guestTriggerTimesRef.current.push(Date.now())
+        setGuestRecentTriggers30s((n) => n + 1)
         const p = getPresetById(msg.presetId)
         if (p && supported) {
           const ok = vibratePattern(p.pattern)
@@ -810,6 +946,7 @@ function GuestFlow({ onBack, supported }: { onBack: () => void; supported: boole
         return
       }
       if (msg.t === 'patternState') {
+        commandSinceHeartbeatRef.current = true
         setLastHostMessage({ kind: 'patternState', at: Date.now() })
         sendAck('patternState')
         setModeView('pattern')
@@ -820,6 +957,7 @@ function GuestFlow({ onBack, supported }: { onBack: () => void; supported: boole
         return
       }
       if (msg.t === 'play') {
+        commandSinceHeartbeatRef.current = true
         setLastHostMessage({ kind: 'play', at: Date.now() })
         sendAck('play')
         setModeView('pattern')
@@ -836,6 +974,8 @@ function GuestFlow({ onBack, supported }: { onBack: () => void; supported: boole
         for (const ev of msg.events) {
           if (ev.offsetMs < initial) continue
           const t = window.setTimeout(() => {
+            guestTriggerTimesRef.current.push(Date.now())
+            setGuestRecentTriggers30s((n) => n + 1)
             const p = getPresetById(ev.presetId)
             if (p && supported) vibratePattern(p.pattern)
           }, delay0 + (ev.offsetMs - initial))
@@ -844,6 +984,7 @@ function GuestFlow({ onBack, supported }: { onBack: () => void; supported: boole
         return
       }
       if (msg.t === 'pause') {
+        commandSinceHeartbeatRef.current = true
         setLastHostMessage({ kind: 'pause', at: Date.now() })
         sendAck('pause')
         clearGuestSched()
@@ -852,8 +993,10 @@ function GuestFlow({ onBack, supported }: { onBack: () => void; supported: boole
         setPlayheadMs(msg.playheadMs)
       }
       if (msg.t === 'sustain') {
+        commandSinceHeartbeatRef.current = true
         setLastHostMessage({ kind: 'sustain', at: Date.now() })
         setGuestSustainLevel(msg.level)
+        guestSustainLevelRef.current = msg.level
         sendAck('sustain')
         if (sustainTimerRef.current) {
           window.clearInterval(sustainTimerRef.current)
@@ -870,8 +1013,12 @@ function GuestFlow({ onBack, supported }: { onBack: () => void; supported: boole
           sustainTimerRef.current = window.setInterval(run, onMs + offMs)
         }
       }
+      if (msg.t === 'disconnect') {
+        endGuestConnection(false)
+        setError('Host ended the connection.')
+      }
     },
-    [supported],
+    [supported, endGuestConnection],
   )
 
   useEffect(() => {
@@ -898,6 +1045,52 @@ function GuestFlow({ onBack, supported }: { onBack: () => void; supported: boole
       if (playheadRaf.current) cancelAnimationFrame(playheadRaf.current)
     }
   }, [connected, modeView, playing, durationMs])
+
+  useEffect(() => {
+    if (!connected) return
+    if (!guestSessionStartedAtRef.current) {
+      guestSessionStartedAtRef.current = Date.now()
+      setGuestSessionStartedAt(guestSessionStartedAtRef.current)
+    }
+    const sendHeartbeat = () => {
+      const ch = channelRef.current
+      if (!ch || ch.readyState !== 'open') return
+      const now = Date.now()
+      guestTriggerTimesRef.current = guestTriggerTimesRef.current.filter((t) => now - t <= 30_000)
+      setGuestRecentTriggers30s(guestTriggerTimesRef.current.length)
+      ch.send(
+        stringifyDcMessage({
+          v: 1,
+          t: 'heartbeat',
+          status: 'alive',
+          sentAt: now,
+          sessionStartedAt: guestSessionStartedAtRef.current ?? now,
+          sustainedLevel: guestSustainLevelRef.current,
+          recentTriggers30s: guestTriggerTimesRef.current.length,
+          lockedMode: guestLockedRef.current,
+        }),
+      )
+      commandSinceHeartbeatRef.current = false
+      lastHeartbeatSentAtRef.current = now
+      setGuestLastHeartbeatAt(now)
+    }
+    sendHeartbeat()
+    const timer = window.setInterval(() => {
+      const now = Date.now()
+      const last = lastHeartbeatSentAtRef.current ?? 0
+      const cadence = commandSinceHeartbeatRef.current ? 5_000 : 30_000
+      if (now - last >= cadence) sendHeartbeat()
+    }, 1_000)
+    return () => window.clearInterval(timer)
+  }, [connected])
+
+  useEffect(() => {
+    guestSustainLevelRef.current = guestSustainLevel
+  }, [guestSustainLevel])
+
+  useEffect(() => {
+    guestLockedRef.current = guestLocked
+  }, [guestLocked])
 
   const createAnswer = async () => {
     setError(null)
@@ -1030,9 +1223,17 @@ function GuestFlow({ onBack, supported }: { onBack: () => void; supported: boole
       )}
 
       {connected && (
-        <section className="panel stack">
+        <section className={`panel stack ${guestLocked ? 'guest-locked-mode' : ''}`}>
           <h2>Receiving haptics</h2>
           <p className="ok">Connected. This UI is read-only.</p>
+          <div className="row wrap">
+            <button type="button" className="btn btn-danger" onClick={() => endGuestConnection(true)}>
+              End connection
+            </button>
+            <button type="button" className="btn" onClick={() => setGuestLocked((v) => !v)}>
+              {guestLocked ? 'Unlock mode' : 'Locked mode'}
+            </button>
+          </div>
           <div className="panel stack">
             <p className="muted">
               Signal received: <strong>{lastHostMessage ? 'Yes' : 'No'}</strong> | Haptics supported:{' '}
@@ -1091,7 +1292,32 @@ function GuestFlow({ onBack, supported }: { onBack: () => void; supported: boole
               </p>
             </>
           )}
+          {guestLocked && (
+            <div className="guest-lock-overlay">
+              <p>Locked mode enabled. Screen dimmed and touch input is blocked.</p>
+              <button type="button" className="btn btn-primary" onClick={() => setGuestLocked(false)}>
+                Unlock
+              </button>
+            </div>
+          )}
         </section>
+      )}
+      {connected && (
+        <PairingHeartbeatFooter
+          role="guest"
+          heartbeat={
+            guestLastHeartbeatAt
+              ? {
+                  sentAt: guestLastHeartbeatAt,
+                  sessionStartedAt: guestSessionStartedAt ?? guestLastHeartbeatAt,
+                  sustainedLevel: guestSustainLevel,
+                  recentTriggers30s: guestRecentTriggers30s,
+                  lockedMode: guestLocked,
+                }
+              : null
+          }
+          sessionStartedAt={guestSessionStartedAt}
+        />
       )}
     </div>
   )

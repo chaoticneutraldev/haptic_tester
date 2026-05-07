@@ -34,6 +34,17 @@ export type DcMessage =
     }
   | { v: 1; t: 'pause'; playheadMs: number }
   | { v: 1; t: 'sustain'; level: number }
+  | { v: 1; t: 'disconnect' }
+  | {
+      v: 1
+      t: 'heartbeat'
+      status: 'alive'
+      sentAt: number
+      sessionStartedAt: number
+      sustainedLevel: number
+      recentTriggers30s: number
+      lockedMode: boolean
+    }
   | {
       v: 1
       t: 'ack'
