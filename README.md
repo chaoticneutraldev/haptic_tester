@@ -2,7 +2,7 @@
 
 Web app for testing haptic behavior across devices.
 
-Live deployment: `https://boisterous-sundae-56358a.netlify.app`
+Live deployment: `https://haptics-tester.netlify.app`
 
 ## Features
 
