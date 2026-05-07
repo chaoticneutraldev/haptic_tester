@@ -23,7 +23,7 @@ async function run() {
   console.log('create session ->', created.status, created.json)
   assert(created.status === 200, 'session create failed')
   const code = created.json?.code
-  assert(typeof code === 'string' && code.length >= 6, 'invalid shortcode')
+  assert(typeof code === 'string' && code.length >= 5, 'invalid shortcode')
 
   // Simulated host action payload delivered to guest via signaling state.
   const offerPayload = 'htz1:SMOKE_TEST_HOST_TRIGGER:instant:short-light'

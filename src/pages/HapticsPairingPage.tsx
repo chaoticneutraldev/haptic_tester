@@ -78,7 +78,7 @@ export function HapticsPairingPage() {
       <div className="page stack">
         <h1>Haptics pairing</h1>
         <p className="lede">
-          WebRTC data channel with <strong>shortcode signaling</strong>: HOST generates an 8-character pair code and
+          WebRTC data channel with <strong>shortcode signaling</strong>: HOST generates an 5-character pair code and
           GUEST joins with that code. Manual offer/answer blob copy (compact format <code>{SIGNALING_COMPACT_PREFIX}</code>
           ) is available as fallback.
         </p>
@@ -229,6 +229,7 @@ function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolea
   const [answerInput, setAnswerInput] = useState('')
   const [pairCode, setPairCode] = useState('')
   const [showManualHost, setShowManualHost] = useState(false)
+  const [lastGuestAck, setLastGuestAck] = useState<{ kind: 'instant' | 'patternState' | 'play' | 'pause'; at: number } | null>(null)
 
   const [mode, setMode] = useState<'instant' | 'pattern'>('instant')
   const [durationMs, setDurationMs] = useState(2000)
@@ -314,8 +315,10 @@ function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolea
       pcRef.current = pc
       channelRef.current = channel
       channel.onmessage = (ev) => {
-        /* host typically does not need guest messages */
-        void ev
+        const msg = parseDcMessage(typeof ev.data === 'string' ? ev.data : '')
+        if (msg?.t === 'ack') {
+          setLastGuestAck({ kind: msg.kind, at: msg.at })
+        }
       }
       const pushHostNet = () => {
         setHostNetSnap({
@@ -452,7 +455,7 @@ function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolea
       </p>
       {pairCode && (
         <p className="session-code">
-          Pair code: <strong>{pairCode}</strong> (share this 8-character code; match TTL 15m, active TTL 12h)
+          Pair code: <strong>{pairCode}</strong> (share this 5-character code; match TTL 15m, active TTL 12h)
         </p>
       )}
 
@@ -541,6 +544,12 @@ function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolea
       {step === 'connected' && (
         <>
           <p className="ok">Data channel open. Use the panel below; the guest device will mirror pattern view.</p>
+          <p className="muted">
+            Guest delivery ack:{' '}
+            {lastGuestAck
+              ? `${lastGuestAck.kind} @ ${new Date(lastGuestAck.at).toLocaleTimeString()}`
+              : 'none yet (send a test action)'}
+          </p>
 
           <div className="panel row wrap">
             <label className="toggle">
@@ -678,6 +687,12 @@ function GuestFlow({ onBack, supported }: { onBack: () => void; supported: boole
   const [error, setError] = useState<string | null>(null)
   const [connected, setConnected] = useState(false)
   const [showManualGuest, setShowManualGuest] = useState(false)
+  const [lastHostMessage, setLastHostMessage] = useState<{ kind: 'instant' | 'patternState' | 'play' | 'pause'; at: number } | null>(null)
+  const [lastHapticExecution, setLastHapticExecution] = useState<{
+    at: number
+    success: boolean
+    reason: 'remote' | 'prime'
+  } | null>(null)
   const [guestNetSnap, setGuestNetSnap] = useState<PeerNetSnapshot | null>(null)
   const pcRef = useRef<RTCPeerConnection | null>(null)
   const channelRef = useRef<RTCDataChannel | null>(null)
@@ -690,7 +705,7 @@ function GuestFlow({ onBack, supported }: { onBack: () => void; supported: boole
   const [playheadMs, setPlayheadMs] = useState(0)
   const playheadRaf = useRef<number | null>(null)
   const playAnchor = useRef<{ startAt: number; startPlayhead: number } | null>(null)
-  const hasPairCode = sessionInput.trim().length >= 6
+  const hasPairCode = sessionInput.trim().length >= 5
 
   const clearGuestSched = () => {
     guestTimeouts.current.forEach((id) => window.clearTimeout(id))
@@ -708,12 +723,25 @@ function GuestFlow({ onBack, supported }: { onBack: () => void; supported: boole
     (raw: string) => {
       const msg = parseDcMessage(raw)
       if (!msg) return
+      const sendAck = (kind: 'instant' | 'patternState' | 'play' | 'pause') => {
+        const ch = channelRef.current
+        if (ch && ch.readyState === 'open') {
+          ch.send(stringifyDcMessage({ v: 1, t: 'ack', kind, at: Date.now() }))
+        }
+      }
       if (msg.t === 'instant') {
+        setLastHostMessage({ kind: 'instant', at: Date.now() })
+        sendAck('instant')
         const p = getPresetById(msg.presetId)
-        if (p && supported) vibratePattern(p.pattern)
+        if (p && supported) {
+          const ok = vibratePattern(p.pattern)
+          setLastHapticExecution({ at: Date.now(), success: ok, reason: 'remote' })
+        }
         return
       }
       if (msg.t === 'patternState') {
+        setLastHostMessage({ kind: 'patternState', at: Date.now() })
+        sendAck('patternState')
         setModeView('pattern')
         setDurationMs(msg.durationMs)
         setEvents(msg.events)
@@ -722,6 +750,8 @@ function GuestFlow({ onBack, supported }: { onBack: () => void; supported: boole
         return
       }
       if (msg.t === 'play') {
+        setLastHostMessage({ kind: 'play', at: Date.now() })
+        sendAck('play')
         setModeView('pattern')
         clearGuestSched()
         setDurationMs(msg.durationMs)
@@ -744,6 +774,8 @@ function GuestFlow({ onBack, supported }: { onBack: () => void; supported: boole
         return
       }
       if (msg.t === 'pause') {
+        setLastHostMessage({ kind: 'pause', at: Date.now() })
+        sendAck('pause')
         clearGuestSched()
         playAnchor.current = null
         setPlaying(false)
@@ -785,7 +817,7 @@ function GuestFlow({ onBack, supported }: { onBack: () => void; supported: boole
     try {
       let resolvedOffer = offerIn.trim()
       const enteredCode = sessionInput.trim().toUpperCase()
-      if (!resolvedOffer && enteredCode.length >= 6) {
+      if (!resolvedOffer && enteredCode.length >= 5) {
         const s = await getSignalState(enteredCode)
         if (!s.offer) throw new Error('Host offer is not ready for this code yet')
         resolvedOffer = s.offer
@@ -796,7 +828,7 @@ function GuestFlow({ onBack, supported }: { onBack: () => void; supported: boole
       const { pc, answerText: ans, waitForChannel } = await guestHandleOffer(resolvedOffer)
       pcRef.current = pc
       setAnswerText(ans)
-      if (enteredCode.length >= 6) {
+      if (enteredCode.length >= 5) {
         await postSignalAnswer(enteredCode, ans)
       }
 
@@ -851,7 +883,7 @@ function GuestFlow({ onBack, supported }: { onBack: () => void; supported: boole
         <section className="panel stack">
           <label className="field">
             <span>HOST pair code (shortcode mode)</span>
-            <input className="input" value={sessionInput} onChange={(e) => setSessionInput(e.target.value.toUpperCase())} maxLength={12} />
+            <input className="input" value={sessionInput} onChange={(e) => setSessionInput(e.target.value.toUpperCase())} maxLength={8} />
           </label>
           <button type="button" className="btn" onClick={() => setShowManualGuest((v) => !v)}>
             {showManualGuest ? 'Hide manual blob/QR fallback' : 'Show manual blob/QR fallback'}
@@ -912,6 +944,41 @@ function GuestFlow({ onBack, supported }: { onBack: () => void; supported: boole
         <section className="panel stack">
           <h2>Receiving haptics</h2>
           <p className="ok">Connected. This UI is read-only.</p>
+          <div className="panel stack">
+            <p className="muted">
+              Signal received: <strong>{lastHostMessage ? 'Yes' : 'No'}</strong> | Haptics supported:{' '}
+              <strong>{supported ? 'Yes' : 'No'}</strong>
+            </p>
+            {lastHapticExecution && (
+              <p className={lastHapticExecution.success ? 'ok' : 'warn'}>
+                Last haptic execution ({lastHapticExecution.reason}) at{' '}
+                {new Date(lastHapticExecution.at).toLocaleTimeString()}:{' '}
+                {lastHapticExecution.success ? 'vibrate() accepted' : 'vibrate() returned false'}
+              </p>
+            )}
+            <div className="row wrap">
+              <button
+                type="button"
+                className="btn"
+                onClick={() => {
+                  const ok = supported ? vibratePattern([25, 40, 25]) : false
+                  setLastHapticExecution({ at: Date.now(), success: ok, reason: 'prime' })
+                }}
+                disabled={!supported}
+              >
+                Prime haptics (tap once)
+              </button>
+              <p className="muted">
+                Some browsers require a direct user gesture before background/remote-triggered vibrations reliably fire.
+              </p>
+            </div>
+          </div>
+          <p className="muted">
+            Last host command:{' '}
+            {lastHostMessage
+              ? `${lastHostMessage.kind} @ ${new Date(lastHostMessage.at).toLocaleTimeString()}`
+              : 'none yet'}
+          </p>
           {!supported && <p className="warn">Vibration API not available—patterns will not be felt here.</p>}
           {modeView === 'instant' && <p className="muted">Waiting for instant taps from the host…</p>}
           {modeView === 'pattern' && (

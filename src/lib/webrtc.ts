@@ -33,6 +33,7 @@ export type DcMessage =
       initialPlayheadMs: number
     }
   | { v: 1; t: 'pause'; playheadMs: number }
+  | { v: 1; t: 'ack'; kind: 'instant' | 'patternState' | 'play' | 'pause'; at: number }
 
 export async function createPeerConnection(label?: string): Promise<RTCPeerConnection> {
   let iceServers: RTCIceServer[]

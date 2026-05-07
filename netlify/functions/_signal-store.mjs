@@ -34,7 +34,7 @@ async function redis(command, ...args) {
   return payload?.result
 }
 
-function code(length = 8) {
+function code(length = 5) {
   const arr = new Uint32Array(length)
   crypto.getRandomValues(arr)
   let out = ''
@@ -48,7 +48,7 @@ function keyFor(codeValue) {
 
 export async function createSession() {
   for (let i = 0; i < 10; i++) {
-    const c = code(8)
+    const c = code(5)
     const key = keyFor(c)
     const base = {
       code: c,
