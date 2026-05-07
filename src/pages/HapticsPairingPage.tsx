@@ -993,7 +993,6 @@ function GuestFlow({ onBack, supported }: { onBack: () => void; supported: boole
     setGuestSustainLevel(0)
     guestSustainLevelRef.current = 0
     stopVibrate()
-    setGuestSafetyStopped(true)
   }, [])
 
   const endGuestConnection = useCallback((notifyHost: boolean) => {
@@ -1231,6 +1230,7 @@ function GuestFlow({ onBack, supported }: { onBack: () => void; supported: boole
       if (!last) return
       if (Date.now() - last > WATCHDOG_MS && !guestSafetyStopped) {
         stopAllGuestActions()
+        setGuestSafetyStopped(true)
         setError('Safety stop: host connection lost; haptics halted.')
       }
     }, 1000)
