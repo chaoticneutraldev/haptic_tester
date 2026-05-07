@@ -546,6 +546,14 @@ function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolea
     return () => window.clearInterval(timer)
   }, [pairCode, step, answerInput])
 
+  useEffect(() => {
+    if (step !== 'connected') return
+    const timer = window.setInterval(() => {
+      send({ v: 1, t: 'hostHeartbeat', sentAt: Date.now() })
+    }, 5000)
+    return () => window.clearInterval(timer)
+  }, [step, send])
+
   const playInstant = (presetId: string) => {
     const p = getPresetById(presetId)
     if (p) vibratePattern(p.pattern)
@@ -1137,6 +1145,10 @@ function GuestFlow({ onBack, supported }: { onBack: () => void; supported: boole
         stopAllGuestActions()
         setLastHostMessage({ kind: 'stopAll', at: Date.now() })
         sendAck('stopAll')
+      }
+      if (msg.t === 'hostHeartbeat') {
+        lastHostActivityAtRef.current = Date.now()
+        setGuestSafetyStopped(false)
       }
       if (msg.t === 'disconnect') {
         lastHostActivityAtRef.current = Date.now()
