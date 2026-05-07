@@ -47,6 +47,15 @@ body {
   background: var(--bg);
 }
 
+body.haptic-sim-active::after {
+  content: '';
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 9999;
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+}
+
 #root {
   min-height: 100svh;
 }

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { CURVE_PRESETS, HAPTIC_PRESETS, getPresetById } from '../lib/hapticPresets'
-import { stopVibrate, vibratePattern, vibrateSupported } from '../lib/vibrate'
+import { bestEffortHapticsMode, stopVibrate, vibratePattern, vibrateSupported } from '../lib/vibrate'
 
 const STORAGE_KEY = 'haptic-tester-custom-pattern'
 
@@ -72,6 +72,8 @@ function LocalHapticsFooter({
 
 export function HapticsTesterPage() {
   const supported = vibrateSupported()
+  const bestEffort = bestEffortHapticsMode()
+  const canTrigger = supported || bestEffort
   const [mode, setMode] = useState<'instant' | 'pattern' | 'sustained'>('instant')
   const [customText, setCustomText] = useState(loadStoredPattern)
   const [customError, setCustomError] = useState<string | null>(null)
@@ -309,7 +311,13 @@ export function HapticsTesterPage() {
         Each cell maps to a <code>navigator.vibrate</code> pattern. iOS-native labels are educational; Safari does not
         expose the same APIs.
       </p>
-      {!supported && <p className="callout">Vibration API not available in this browser.</p>}
+      {!supported && (
+        <p className="callout">
+          {bestEffort
+            ? 'Physical haptics are best effort on this iOS browser. Pattern timing is simulated when direct vibration is unavailable.'
+            : 'Vibration API not available in this browser.'}
+        </p>
+      )}
 
       <section className="panel row wrap">
         <label className="toggle">
@@ -337,7 +345,7 @@ export function HapticsTesterPage() {
                     type="button"
                     className="preset-cell"
                     onClick={() => playPreset(p.id)}
-                    disabled={!supported}
+                    disabled={!canTrigger}
                   >
                     <span className="preset-name">{p.name}</span>
                     <span className="preset-pattern">{p.pattern.join(' · ')} ms</span>
@@ -365,20 +373,20 @@ export function HapticsTesterPage() {
             </label>
             {customError && <p className="warn">{customError}</p>}
             <div className="row wrap">
-              <button type="button" className="btn btn-primary" onClick={playCustom} disabled={!supported}>
+              <button type="button" className="btn btn-primary" onClick={playCustom} disabled={!canTrigger}>
                 Play custom
               </button>
-              <button type="button" className="btn" onClick={() => applyCurvePreset('game-progress')} disabled={!supported}>
+              <button type="button" className="btn" onClick={() => applyCurvePreset('game-progress')} disabled={!canTrigger}>
                 Preset: game progress
               </button>
-              <button type="button" className="btn" onClick={() => applyCurvePreset('footsteps')} disabled={!supported}>
+              <button type="button" className="btn" onClick={() => applyCurvePreset('footsteps')} disabled={!canTrigger}>
                 Preset: footsteps
               </button>
               <button
                 type="button"
                 className="btn"
                 onClick={() => applyCurvePreset('urgent-attention')}
-                disabled={!supported}
+                disabled={!canTrigger}
               >
                 Preset: urgent attention
               </button>
@@ -420,7 +428,7 @@ export function HapticsTesterPage() {
               <input type="checkbox" checked={loopMode} onChange={(e) => setLoopMode(e.target.checked)} />
             </label>
             {!playing ? (
-              <button type="button" className="btn btn-primary" onClick={startPattern} disabled={!supported}>
+              <button type="button" className="btn btn-primary" onClick={startPattern} disabled={!canTrigger}>
                 Play
               </button>
             ) : (
@@ -499,7 +507,7 @@ export function HapticsTesterPage() {
           <h2>Sustained mode</h2>
           <p className="muted">Set a continuous local buzz level. 0 turns sustained buzz off.</p>
           <div className="row wrap">
-            <button type="button" className="btn" onClick={() => sendSustainLevel(sustainLevel - 10)} disabled={!supported}>
+            <button type="button" className="btn" onClick={() => sendSustainLevel(sustainLevel - 10)} disabled={!canTrigger}>
               -10
             </button>
             <input
@@ -509,28 +517,28 @@ export function HapticsTesterPage() {
               step={1}
               value={sustainLevel}
               onChange={(e) => sendSustainLevel(Number(e.target.value))}
-              disabled={!supported}
+              disabled={!canTrigger}
             />
-            <button type="button" className="btn" onClick={() => sendSustainLevel(sustainLevel + 10)} disabled={!supported}>
+            <button type="button" className="btn" onClick={() => sendSustainLevel(sustainLevel + 10)} disabled={!canTrigger}>
               +10
             </button>
             <span className="pill">Level {sustainLevel}</span>
           </div>
           <div className="row wrap">
-            <button type="button" className="btn" onClick={() => sendSustainLevel(0)} disabled={!supported}>
+            <button type="button" className="btn" onClick={() => sendSustainLevel(0)} disabled={!canTrigger}>
               Stop
             </button>
-            <button type="button" className="btn btn-primary" onClick={() => sendSustainLevel(60)} disabled={!supported}>
+            <button type="button" className="btn btn-primary" onClick={() => sendSustainLevel(60)} disabled={!canTrigger}>
               Medium
             </button>
-            <button type="button" className="btn" onClick={() => sendSustainLevel(90)} disabled={!supported}>
+            <button type="button" className="btn" onClick={() => sendSustainLevel(90)} disabled={!canTrigger}>
               Strong
             </button>
           </div>
         </section>
       )}
       <LocalHapticsFooter
-        supported={supported}
+        supported={canTrigger}
         mode={mode}
         playing={playing}
         playheadMs={playheadMs}

@@ -14,7 +14,7 @@ import {
   type DcMessage,
   type TimelineEvent,
 } from '../lib/webrtc'
-import { stopVibrate, vibratePattern, vibrateSupported } from '../lib/vibrate'
+import { bestEffortHapticsMode, stopVibrate, vibratePattern, vibrateSupported } from '../lib/vibrate'
 
 type Role = 'pick' | 'host' | 'guest'
 
@@ -983,6 +983,8 @@ function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolea
 }
 
 function GuestFlow({ onBack, supported }: { onBack: () => void; supported: boolean }) {
+  const bestEffort = bestEffortHapticsMode()
+  const canTriggerLocal = supported || bestEffort
   const [sessionInput, setSessionInput] = useState('')
   const [offerIn, setOfferIn] = useState('')
   const [answerText, setAnswerText] = useState('')
@@ -1103,7 +1105,7 @@ function GuestFlow({ onBack, supported }: { onBack: () => void; supported: boole
         guestTriggerTimesRef.current.push(Date.now())
         setGuestRecentTriggers30s((n) => n + 1)
         const p = getPresetById(msg.presetId)
-        if (p && supported) {
+        if (p && canTriggerLocal) {
           const ok = vibratePattern(p.pattern)
           setLastHapticExecution({ at: Date.now(), success: ok, reason: 'remote' })
         }
@@ -1174,7 +1176,7 @@ function GuestFlow({ onBack, supported }: { onBack: () => void; supported: boole
           window.clearInterval(sustainTimerRef.current)
           sustainTimerRef.current = null
         }
-        if (msg.level > 0 && supported) {
+        if (msg.level > 0 && canTriggerLocal) {
           const onMs = Math.max(20, Math.round((msg.level / 100) * 240))
           const offMs = Math.max(35, 180 - Math.round((msg.level / 100) * 120))
           const run = () => {
@@ -1201,7 +1203,7 @@ function GuestFlow({ onBack, supported }: { onBack: () => void; supported: boole
         setError('Host ended the connection.')
       }
     },
-    [supported, endGuestConnection, stopAllGuestActions],
+    [canTriggerLocal, endGuestConnection, stopAllGuestActions, supported],
   )
 
   useEffect(() => {
@@ -1449,8 +1451,8 @@ function GuestFlow({ onBack, supported }: { onBack: () => void; supported: boole
           </div>
           <div className="panel stack">
             <p className="muted">
-              Signal received: <strong>{lastHostMessage ? 'Yes' : 'No'}</strong> | Haptics supported:{' '}
-              <strong>{supported ? 'Yes' : 'No'}</strong>
+              Signal received: <strong>{lastHostMessage ? 'Yes' : 'No'}</strong> | Haptics path:{' '}
+              <strong>{supported ? 'Physical vibration' : bestEffort ? 'Best effort simulation' : 'Unavailable'}</strong>
             </p>
             {lastHapticExecution && (
               <p className={lastHapticExecution.success ? 'ok' : 'warn'}>
@@ -1464,10 +1466,10 @@ function GuestFlow({ onBack, supported }: { onBack: () => void; supported: boole
                 type="button"
                 className="btn"
                 onClick={() => {
-                  const ok = supported ? vibratePattern([25, 40, 25]) : false
+                  const ok = canTriggerLocal ? vibratePattern([25, 40, 25]) : false
                   setLastHapticExecution({ at: Date.now(), success: ok, reason: 'prime' })
                 }}
-                disabled={!supported}
+                disabled={!canTriggerLocal}
               >
                 Prime haptics (tap once)
               </button>
@@ -1483,7 +1485,13 @@ function GuestFlow({ onBack, supported }: { onBack: () => void; supported: boole
               : 'none yet'}
           </p>
           {lastHostMessage?.kind === 'sustain' && <p className="muted">Current sustained level: {guestSustainLevel}</p>}
-          {!supported && <p className="warn">Vibration API not available—patterns will not be felt here.</p>}
+          {!supported && (
+            <p className="warn">
+              {bestEffort
+                ? 'Physical haptics are best effort on this iOS browser. Pattern timing is simulated where direct vibration is unavailable.'
+                : 'Vibration API not available—patterns will not be felt here.'}
+            </p>
+          )}
           {modeView === 'instant' && <p className="muted">Waiting for instant taps from the host…</p>}
           {modeView === 'pattern' && (
             <>
