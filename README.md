@@ -1,73 +1,59 @@
-# React + TypeScript + Vite
+# Haptic Tester
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+Web app for testing haptic behavior across devices.
 
-Currently, two official plugins are available:
+Live deployment: `https://boisterous-sundae-56358a.netlify.app`
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+## Features
 
-## React Compiler
+- `Device check`: best-effort device profile + haptics support probe.
+- `Haptics tester`: preset vibration patterns and custom pattern editing.
+- `Haptics pairing`: HOST/GUEST manual WebRTC signaling (compact blobs), instant mode, and pattern timeline mode.
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+## Local development
 
-## Expanding the ESLint configuration
-
-If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
-
-```js
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-
-      // Remove tseslint.configs.recommended and replace with this
-      tseslint.configs.recommendedTypeChecked,
-      // Alternatively, use this for stricter rules
-      tseslint.configs.strictTypeChecked,
-      // Optionally, add this for stylistic rules
-      tseslint.configs.stylisticTypeChecked,
-
-      // Other configs...
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+```bash
+npm install
+npm run dev
 ```
 
-You can also install [eslint-plugin-react-x](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-dom) for React-specific lint rules:
+## Deploy (Netlify)
 
-```js
-// eslint.config.js
-import reactX from 'eslint-plugin-react-x'
-import reactDom from 'eslint-plugin-react-dom'
+This repo is configured for Netlify in `netlify.toml`.
 
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-      // Enable lint rules for React
-      reactX.configs['recommended-typescript'],
-      // Enable lint rules for React DOM
-      reactDom.configs.recommended,
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
-```
+- Build command: `npm run build`
+- Publish directory: `dist`
+- Netlify Functions directory: `netlify/functions`
+
+### SPA + API routing
+
+`netlify.toml` routes:
+
+- `/api/turn/ice-config` -> Netlify Function `turn-ice-config`
+- `/api/turn/usage/:username` -> Netlify Function `turn-usage`
+- everything else -> `/index.html` (SPA fallback)
+
+## TURN relay via Metered (server-side only)
+
+The frontend requests ICE config from `/api/turn/ice-config`. The function:
+
+- creates a Metered TURN credential,
+- sets auto-expiry (default 24h),
+- returns ICE servers to the client,
+- keeps your Metered `secretKey` off the frontend.
+
+### Netlify environment variables
+
+- `METERED_APP_NAME` (example: `haptic-test-cndev.metered.live`)
+- `METERED_SECRET_KEY`
+- `DEFAULT_EXPIRY_SECONDS` (optional, default `86400`)
+
+### Function endpoints
+
+- `POST /.netlify/functions/turn-ice-config` (or `/api/turn/ice-config` through redirect)
+- `GET /.netlify/functions/turn-usage/:username` (or `/api/turn/usage/:username`)
+
+## Notes
+
+- If the TURN function is unavailable, WebRTC falls back to STUN-only.
+- Pairing uses manual signaling blobs (compressed when available); the 8-character session code is a human label.

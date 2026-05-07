@@ -50,9 +50,10 @@ function IcePathPanel({ snap, context }: { snap: PeerNetSnapshot | null; context
       )}
       {(iceFailed || connFailed) && (
         <p className="warn">
-          The browsers could not establish a direct link. This app uses only STUN (no TURN relay). Try{' '}
-          <strong>both devices on the same Wi‑Fi</strong>, turn off VPNs, or use one phone’s hotspot for the other—then
-          run <strong>Generate offer</strong> again on the host and redo the blobs.
+          The browsers could not establish a link. This can happen with restrictive NAT/firewalls, network filtering, or
+          invalid/expired TURN credentials. Try <strong>both devices on the same Wi‑Fi</strong>, turn off VPNs, or use
+          one phone’s hotspot for the other—then run <strong>Generate offer</strong> again on the host and redo the
+          blobs.
         </p>
       )}
     </div>

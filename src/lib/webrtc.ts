@@ -1,9 +1,8 @@
 import { type OfferBundleV1, type AnswerBundleV1 } from './signaling'
 import { formatSignalingForPaste, parseSignalingPaste } from './signalingCodec'
+import { fetchTurnIceServers, STUN_ONLY_ICE_SERVERS } from './turnApi'
 
-export const DEFAULT_ICE_SERVERS: RTCIceServer[] = [
-  { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] },
-]
+export const DEFAULT_ICE_SERVERS: RTCIceServer[] = STUN_ONLY_ICE_SERVERS
 
 /** Browsers (especially Safari / iOS) may never set iceGatheringState to "complete"; stop waiting after this. */
 const ICE_GATHER_SOFT_TIMEOUT_MS = 20_000
@@ -35,8 +34,15 @@ export type DcMessage =
     }
   | { v: 1; t: 'pause'; playheadMs: number }
 
-export function createPeerConnection(): RTCPeerConnection {
-  return new RTCPeerConnection({ iceServers: DEFAULT_ICE_SERVERS })
+export async function createPeerConnection(label?: string): Promise<RTCPeerConnection> {
+  let iceServers: RTCIceServer[]
+  try {
+    iceServers = await fetchTurnIceServers(label)
+  } catch {
+    // Fallback keeps pairing usable if function is unavailable.
+    iceServers = DEFAULT_ICE_SERVERS
+  }
+  return new RTCPeerConnection({ iceServers })
 }
 
 /**
@@ -88,7 +94,7 @@ export async function hostCreateOffer(): Promise<{
   channel: RTCDataChannel
   offerText: string
 }> {
-  const pc = createPeerConnection()
+  const pc = await createPeerConnection('host-pairing')
   const candidates: RTCIceCandidate[] = collectIce(pc)
   const channel = pc.createDataChannel('haptic', { ordered: true })
   const offer = await pc.createOffer()
@@ -117,7 +123,7 @@ export async function guestHandleOffer(offerRaw: string): Promise<{
   const bundle = await parseSignalingPaste(offerRaw)
   if (bundle.kind !== 'offer') throw new Error('Expected offer bundle')
 
-  const pc = createPeerConnection()
+  const pc = await createPeerConnection('guest-pairing')
   const candidates: RTCIceCandidate[] = collectIce(pc)
 
   let resolveChannel: (ch: RTCDataChannel) => void
