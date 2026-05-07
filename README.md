@@ -10,6 +10,25 @@ Live deployment: `https://haptics-tester.netlify.app`
 - `Haptics tester`: preset vibration patterns and custom pattern editing.
 - `Haptics pairing`: HOST/GUEST shortcode signaling (8-char code), manual blob fallback, instant mode, and pattern timeline mode.
 
+## Quick testing instructions
+
+### Test haptics solo (`Haptics Tester`)
+
+1. Open the app and go to `Haptics Tester`.
+2. Start in `Instant` mode and tap a preset to confirm your device can vibrate.
+3. Try `Pattern` mode to build a short timeline and press `Play`.
+4. Try `Sustained` mode and move the level slider up/down (set to `0` to stop).
+5. Use `Stop all` any time to immediately stop local playback/sustain.
+
+### Test haptics with another person (`Pairing`)
+
+1. Person A opens `Pairing` and selects `I am HOST`.
+2. Person B opens `Pairing` and selects `I am GUEST`.
+3. HOST taps `Generate offer` and shares the pair code.
+4. GUEST enters the pair code, taps `Create answer`, then waits for connect.
+5. Once connected, HOST sends `Instant`, `Pattern`, or `Sustained` actions; GUEST feels them.
+6. Use `Stop all` (HOST footer) to halt guest actions immediately, and `End connection` when done.
+
 ## Local development
 
 ```bash

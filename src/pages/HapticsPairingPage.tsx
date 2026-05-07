@@ -284,6 +284,7 @@ function PairingHeartbeatFooter({
 }
 
 function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolean }) {
+  const MATCH_TTL_MS = 15 * 60 * 1000
   const sessionId = useMemo(() => generateSessionId(), [])
   const [step, setStep] = useState<HostStep>('idle')
   const [busy, setBusy] = useState(false)
@@ -297,6 +298,7 @@ function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolea
   const [offerText, setOfferText] = useState('')
   const [answerInput, setAnswerInput] = useState('')
   const [pairCode, setPairCode] = useState('')
+  const [offerExpiresAt, setOfferExpiresAt] = useState<number | null>(null)
   const [showManualHost, setShowManualHost] = useState(false)
   const [lastGuestAck, setLastGuestAck] = useState<{ kind: HostAckKind; at: number } | null>(null)
 
@@ -320,6 +322,13 @@ function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolea
   const playheadRaf = useRef<number | null>(null)
   const playAnchor = useRef<{ startAt: number; startPlayhead: number } | null>(null)
   const localTimeouts = useRef<number[]>([])
+  const applyAnswerButtonRef = useRef<HTMLButtonElement | null>(null)
+  const prevAnswerTrimmedRef = useRef('')
+  const [countdownNow, setCountdownNow] = useState(() => Date.now())
+  const answerReady = Boolean(answerInput.trim()) && !hostHandoff
+  const answerTimeoutRemainingS =
+    offerExpiresAt && step !== 'connected' ? Math.max(0, Math.ceil((offerExpiresAt - countdownNow) / 1000)) : null
+  const answerTimeoutExpired = typeof answerTimeoutRemainingS === 'number' && answerTimeoutRemainingS <= 0
 
   const send = useCallback((msg: DcMessage) => {
     const ch = channelRef.current
@@ -343,6 +352,7 @@ function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolea
       setHostHandoff(false)
       setHostNetSnap(null)
       setPairCode('')
+      setOfferExpiresAt(null)
       setOfferText('')
       setAnswerInput('')
       setLastGuestAck(null)
@@ -441,6 +451,7 @@ function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolea
     setError(null)
     setHostHandoff(false)
     setAnswerInput('')
+    setOfferExpiresAt(null)
     setHostNetSnap(null)
     const gen = ++hostOfferGenerationRef.current
     setBusy(true)
@@ -492,6 +503,7 @@ function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolea
       const signal = await createSignalSession()
       setPairCode(signal.code)
       await postSignalOffer(signal.code, text)
+      setOfferExpiresAt(Date.now() + MATCH_TTL_MS)
       setStep('offer-ready')
       channel.onopen = () => {
         pushHostNet()
@@ -545,6 +557,23 @@ function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolea
     }, 2000)
     return () => window.clearInterval(timer)
   }, [pairCode, step, answerInput])
+
+  useEffect(() => {
+    if (!offerExpiresAt || step === 'connected') return
+    const t = window.setInterval(() => setCountdownNow(Date.now()), 1000)
+    return () => window.clearInterval(t)
+  }, [offerExpiresAt, step])
+
+  useEffect(() => {
+    const trimmed = answerInput.trim()
+    if (trimmed && !prevAnswerTrimmedRef.current && !hostHandoff) {
+      window.setTimeout(() => {
+        applyAnswerButtonRef.current?.focus()
+        applyAnswerButtonRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+      }, 50)
+    }
+    prevAnswerTrimmedRef.current = trimmed
+  }, [answerInput, hostHandoff])
 
   useEffect(() => {
     if (step !== 'connected') return
@@ -706,10 +735,27 @@ function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolea
                     : 'Waiting for guest answer via shortcode...'}
                 </p>
               )}
+              {answerReady && (
+                <p className="apply-answer-ready" role="status" aria-live="polite">
+                  Answer ready. Tap <strong>Apply answer</strong> now.
+                  {typeof answerTimeoutRemainingS === 'number' && (
+                    <>
+                      {' '}
+                      Expires in <strong>{answerTimeoutRemainingS}s</strong>.
+                    </>
+                  )}
+                </p>
+              )}
+              {answerTimeoutExpired && (
+                <p className="warn">
+                  Pair-code match window expired. Generate a new offer to continue pairing.
+                </p>
+              )}
               <button
+                ref={applyAnswerButtonRef}
                 type="button"
-                className="btn btn-primary"
-                disabled={busy || !answerInput.trim() || hostHandoff}
+                className={`btn btn-primary ${answerReady ? 'btn-ready-apply' : ''}`}
+                disabled={busy || !answerInput.trim() || hostHandoff || answerTimeoutExpired}
                 onClick={applyAnswer}
               >
                 Apply answer
