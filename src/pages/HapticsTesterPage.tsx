@@ -1,8 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { CURVE_PRESETS, HAPTIC_PRESETS, getPresetById } from '../lib/hapticPresets'
+import { RECOMMENDED_PATTERN_DURATION_MS, RECOMMENDED_PATTERN_EVENTS } from '../lib/recommendedPattern'
 import { bestEffortHapticsMode, stopVibrate, vibratePattern, vibrateSupported } from '../lib/vibrate'
 
 const STORAGE_KEY = 'haptic-tester-custom-pattern'
+const INTENSITY_CHECK_STORAGE_KEY = 'haptic-tester-intensity-check'
 
 function parsePatternInput(text: string): number[] | null {
   const parts = text
@@ -20,6 +22,15 @@ function loadStoredPattern(): string {
     return localStorage.getItem(STORAGE_KEY) ?? '20, 40, 20, 40, 60'
   } catch {
     return '20, 40, 20, 40, 60'
+  }
+}
+
+function loadIntensityCheck(): 'unknown' | 'felt' | 'weak' {
+  try {
+    const raw = localStorage.getItem(INTENSITY_CHECK_STORAGE_KEY)
+    return raw === 'felt' || raw === 'weak' ? raw : 'unknown'
+  } catch {
+    return 'unknown'
   }
 }
 
@@ -92,6 +103,7 @@ export function HapticsTesterPage() {
   const [playing, setPlaying] = useState(false)
   const [lastActionAt, setLastActionAt] = useState<number | null>(null)
   const [lastAction, setLastAction] = useState<string | null>(null)
+  const [intensityCheck, setIntensityCheck] = useState<'unknown' | 'felt' | 'weak'>(loadIntensityCheck)
   const playAnchorRef = useRef<{ startAt: number; startPlayhead: number } | null>(null)
   const playheadRafRef = useRef<number | null>(null)
   const patternTimeoutsRef = useRef<number[]>([])
@@ -268,6 +280,21 @@ export function HapticsTesterPage() {
     }))
   }
 
+  const loadRecommendedPattern = useCallback(() => {
+    updateActivePattern((p) => ({
+      ...p,
+      durationMs: RECOMMENDED_PATTERN_DURATION_MS,
+      events: RECOMMENDED_PATTERN_EVENTS.map((ev) => ({
+        id: crypto.randomUUID(),
+        offsetMs: ev.offsetMs,
+        presetId: ev.presetId,
+      })),
+    }))
+    setPlayheadMs(0)
+    setLastActionAt(Date.now())
+    setLastAction('Pattern: Loaded recommended preset')
+  }, [updateActivePattern])
+
   const removePatternEvent = (id: string) => {
     updateActivePattern((p) => ({ ...p, events: p.events.filter((e) => e.id !== id) }))
   }
@@ -296,6 +323,20 @@ export function HapticsTesterPage() {
     sustainTimerRef.current = window.setInterval(run, onMs + offMs)
   }
 
+  const runIntensityProbe = useCallback(() => {
+    // Web APIs cannot read system vibration intensity, so use a user-confirmed pulse check.
+    const ok = vibratePattern([90, 45, 120])
+    if (!ok) setIntensityCheck('weak')
+  }, [])
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(INTENSITY_CHECK_STORAGE_KEY, intensityCheck)
+    } catch {
+      /* ignore */
+    }
+  }, [intensityCheck])
+
   useEffect(() => {
     return () => {
       if (sustainTimerRef.current) window.clearInterval(sustainTimerRef.current)
@@ -317,6 +358,37 @@ export function HapticsTesterPage() {
             ? 'Physical haptics are best effort on this iOS browser. Pattern timing is simulated when direct vibration is unavailable.'
             : 'Vibration API not available in this browser.'}
         </p>
+      )}
+      {canTrigger && intensityCheck !== 'felt' && (
+        <p className="warn">
+          Intensity check not confirmed strong. For consistent test results, verify device vibration intensity is set to max.
+        </p>
+      )}
+      {canTrigger && (
+        <section className="panel stack">
+          <h2>Vibration intensity check</h2>
+          <p className="muted">
+            Browser APIs cannot detect your device vibration-intensity setting directly. Run this check and confirm what
+            you feel.
+          </p>
+          <div className="row wrap">
+            <button type="button" className="btn" onClick={runIntensityProbe}>
+              Run intensity check pulse
+            </button>
+            <button type="button" className="btn" onClick={() => setIntensityCheck('felt')}>
+              Felt strong
+            </button>
+            <button type="button" className="btn btn-danger" onClick={() => setIntensityCheck('weak')}>
+              Weak / no vibration
+            </button>
+          </div>
+          {intensityCheck === 'weak' && (
+            <p className="warn">
+              Vibration may be reduced by system settings. For consistent testing, raise device vibration/haptics intensity
+              to maximum and disable battery-saver modes.
+            </p>
+          )}
+        </section>
       )}
 
       <section className="panel row wrap">
@@ -421,6 +493,9 @@ export function HapticsTesterPage() {
             </button>
             <button type="button" className="btn" onClick={() => adjustPatternDuration(1000)} disabled={patternDurationMs >= 16000}>
               +1s
+            </button>
+            <button type="button" className="btn" onClick={loadRecommendedPattern} disabled={playing}>
+              Load recommended pattern
             </button>
             <span className="pill">{(patternDurationMs / 1000).toFixed(0)}s</span>
             <label className="field inline">
