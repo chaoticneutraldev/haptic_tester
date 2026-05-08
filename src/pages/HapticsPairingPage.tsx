@@ -450,7 +450,7 @@ function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolea
         }))
       }
     },
-    [removeGuest, updateGuest],
+    [MATCH_TTL_MS, removeGuest, updateGuest],
   )
 
   const applyAnswerForGuest = useCallback(
