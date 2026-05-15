@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import { collectDeviceInfo, type DeviceInfo } from '../lib/deviceDetect'
-import { bestEffortHapticsMode, vibratePattern, vibrateSupported, stopVibrate } from '../lib/vibrate'
+import { useHapticOutput } from '../lib/hapticOutputContext'
+import { bestEffortHapticsMode, vibrateSupported } from '../lib/vibrate'
 import { DeviceSilhouette } from '../components/DeviceSilhouette'
 
 export function DeviceCheckPage() {
@@ -9,6 +10,8 @@ export function DeviceCheckPage() {
   const supported = vibrateSupported()
   const bestEffort = bestEffortHapticsMode()
   const canTrigger = supported || bestEffort
+  const { playRoutingPattern, stopAllHardwareOutputs, intifaceReady } = useHapticOutput()
+  const effectiveTrigger = canTrigger || intifaceReady
 
   useEffect(() => {
     let cancelled = false
@@ -21,22 +24,30 @@ export function DeviceCheckPage() {
   }, [])
 
   const runTest = useCallback(() => {
-    if (!canTrigger) {
-      setLastTest('Vibration API not available in this browser.')
+    if (!effectiveTrigger) {
+      setLastTest('Neither phone vibration nor Intiface routing is available here.')
       return
     }
-    const ok = vibratePattern([25, 50, 25])
-    setLastTest(ok ? (supported ? 'Short pattern fired.' : 'Best-effort haptic simulation fired.') : 'vibrate() returned false.')
-  }, [canTrigger, supported])
+    playRoutingPattern([25, 50, 25])
+    setLastTest(
+      canTrigger ? (supported ? 'Short pattern fired.' : 'Best-effort haptic simulation fired.') : ' Routed to Bluetooth device.',
+    )
+  }, [canTrigger, effectiveTrigger, playRoutingPattern, supported])
 
   const startHoldTest = useCallback(() => {
-    if (!canTrigger) {
-      setLastTest('Vibration API not available in this browser.')
+    if (!effectiveTrigger) {
+      setLastTest('Neither phone vibration nor Intiface routing is available here.')
       return
     }
-    const ok = vibratePattern([800])
-    setLastTest(ok ? (supported ? 'Long pulse while held…' : 'Best-effort hold simulation active…') : 'vibrate() returned false.')
-  }, [canTrigger, supported])
+    playRoutingPattern([800])
+    setLastTest(
+      canTrigger
+        ? supported
+          ? 'Long pulse while held…'
+          : 'Best-effort hold simulation active…'
+        : 'Long pulse routed to Bluetooth device.',
+    )
+  }, [canTrigger, effectiveTrigger, playRoutingPattern, supported])
 
   return (
     <div className="page stack">
@@ -95,16 +106,16 @@ export function DeviceCheckPage() {
         <h2>Live test</h2>
         <p>Buttons require a direct tap (browser security). Hold the second button for a longer pattern.</p>
         <div className="row">
-          <button type="button" className="btn btn-primary" onClick={() => runTest()} disabled={!canTrigger}>
+          <button type="button" className="btn btn-primary" onClick={() => runTest()} disabled={!effectiveTrigger}>
             Tap test
           </button>
           <button
             type="button"
             className="btn"
             onPointerDown={() => startHoldTest()}
-            onPointerUp={() => stopVibrate()}
-            onPointerLeave={() => stopVibrate()}
-            disabled={!canTrigger}
+            onPointerUp={() => stopAllHardwareOutputs()}
+            onPointerLeave={() => stopAllHardwareOutputs()}
+            disabled={!effectiveTrigger}
           >
             Press &amp; hold
           </button>

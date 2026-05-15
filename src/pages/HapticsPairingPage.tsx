@@ -21,7 +21,8 @@ import {
   type DcMessage,
   type TimelineEvent,
 } from '../lib/webrtc'
-import { bestEffortHapticsMode, stopVibrate, vibratePattern, vibrateSupported } from '../lib/vibrate'
+import { useHapticOutput } from '../lib/hapticOutputContext'
+import { bestEffortHapticsMode, vibrateSupported } from '../lib/vibrate'
 
 type Role = 'pick' | 'host' | 'guest'
 
@@ -57,6 +58,19 @@ type GuestHeartbeat = {
 }
 
 const GUEST_INTENSITY_CHECK_STORAGE_KEY = 'haptic-pairing-guest-intensity-check'
+
+const HOST_PAIRING_PREVIEW_STORAGE_KEY = 'haptic-host-pairing-preview-scale'
+
+function loadHostPairingPreviewScale(): number {
+  try {
+    const raw = localStorage.getItem(HOST_PAIRING_PREVIEW_STORAGE_KEY)
+    const n = Number(raw)
+    if (n === 0 || n === 0.25 || n === 0.5 || n === 0.75 || n === 1) return n
+  } catch {
+    /* ignore */
+  }
+  return 1
+}
 
 function loadGuestIntensityCheck(): 'unknown' | 'felt' | 'weak' {
   try {
@@ -270,6 +284,15 @@ function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolea
   /** Only used if the server omits `matchExpiresAt` (e.g. older signaling rows). */
   const MATCH_TTL_MS_FALLBACK = 2 * 60 * 60 * 1000
   const sessionId = useMemo(() => generateSessionId(), [])
+  const { playRoutingPattern, stopAllHardwareOutputs } = useHapticOutput()
+  const [hostPreviewScale, setHostPreviewScale] = useState(loadHostPairingPreviewScale)
+  useEffect(() => {
+    try {
+      localStorage.setItem(HOST_PAIRING_PREVIEW_STORAGE_KEY, String(hostPreviewScale))
+    } catch {
+      /* ignore */
+    }
+  }, [hostPreviewScale])
   const [mode, setMode] = useState<'instant' | 'pattern' | 'sustained'>('instant')
   const [patterns, setPatterns] = useState<HostPatternConfig[]>(HOST_PATTERN_PRESETS)
   const [activePatternId, setActivePatternId] = useState(HOST_PATTERN_PRESETS[0]?.id ?? 'pattern-a')
@@ -607,12 +630,12 @@ function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolea
         if (ev.offsetMs < initial) continue
         const t = window.setTimeout(() => {
           const p = getPresetById(ev.presetId)
-          if (p) vibratePattern(p.pattern)
+          if (p) playRoutingPattern(p.pattern, { hostPairingPreviewScale: hostPreviewScale })
         }, delay0 + (ev.offsetMs - initial))
         localTimeouts.current.push(t)
       }
     },
-    [broadcast, clearLocalSched, durationMs, events],
+    [broadcast, clearLocalSched, durationMs, events, hostPreviewScale, playRoutingPattern],
   )
 
   const broadcastPatternState = useCallback(
@@ -719,7 +742,7 @@ function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolea
 
   const playInstant = (presetId: string) => {
     const p = getPresetById(presetId)
-    if (p) vibratePattern(p.pattern)
+    if (p) playRoutingPattern(p.pattern, { hostPairingPreviewScale: hostPreviewScale })
     const seq = seqRef.current++
     setGuests((prev) =>
       prev.map((guest) =>
@@ -754,6 +777,7 @@ function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolea
     setPlaying(false)
     setPlayheadMs(0)
     setSustainLevel(0)
+    stopAllHardwareOutputs()
     broadcast({ v: 1, t: 'stopAll' })
   }
 
@@ -824,6 +848,27 @@ function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolea
       <p className="session-code">
         Session code: <strong>{sessionId}</strong> (read this aloud to each guest for verification)
       </p>
+
+      <section className="panel stack">
+        <h2>Local preview (this device)</h2>
+        <p className="muted">
+          When <strong>you</strong> trigger instant taps or timelines on this page, this scales how strongly this device
+          buzzes or drives Intiface motors. Commands to guests stay at full intensity.
+        </p>
+        <label className="field">
+          <span>Strength on HOST interactions</span>
+          <select
+            value={String(hostPreviewScale)}
+            onChange={(e) => setHostPreviewScale(Number(e.target.value))}
+          >
+            <option value="0">Off (0%)</option>
+            <option value="0.25">Reduce 75% (25% remaining)</option>
+            <option value="0.5">Reduce 50% (50% remaining)</option>
+            <option value="0.75">Reduce 25% (75% remaining)</option>
+            <option value="1">Full (100%)</option>
+          </select>
+        </label>
+      </section>
 
       <section className="panel stack">
         <div className="row spread">
@@ -1015,7 +1060,12 @@ function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolea
           {mode === 'instant' && (
             <section className="panel stack">
               <h2>Haptic actions (broadcast)</h2>
-              {!supported && <p className="muted">This device cannot vibrate, but commands still broadcast to guests.</p>}
+              {!supported && (
+                <p className="muted">
+                  This device may not expose <code>navigator.vibrate</code>. You can still broadcast; optional phone
+                  haptics simulation or Bluetooth hardware is configured in the <strong>Haptics output</strong> bar above.
+                </p>
+              )}
               <div className="preset-grid">
                 {HAPTIC_PRESETS.map((p) => (
                   <button key={p.id} type="button" className="preset-cell" onClick={() => playInstant(p.id)}>
@@ -1239,6 +1289,7 @@ const RECONNECT_HANDOFF_COOLDOWN_SEC = 10
 function GuestFlow({ onBack, supported }: { onBack: () => void; supported: boolean }) {
   const bestEffort = bestEffortHapticsMode()
   const canTriggerLocal = supported || bestEffort
+  const { playRoutingPattern, pulseRoutingSustain, stopAllHardwareOutputs, intifaceReady } = useHapticOutput()
   const [sessionInput, setSessionInput] = useState('')
   const [offerIn, setOfferIn] = useState('')
   const [answerText, setAnswerText] = useState('')
@@ -1309,8 +1360,8 @@ function GuestFlow({ onBack, supported }: { onBack: () => void; supported: boole
     setPlayheadMs(0)
     setGuestSustainLevel(0)
     guestSustainLevelRef.current = 0
-    stopVibrate()
-  }, [])
+    stopAllHardwareOutputs()
+  }, [stopAllHardwareOutputs])
 
   const endGuestConnection = useCallback((notifyHost: boolean, intentionalGuestEnd = false) => {
     if (intentionalGuestEnd) guestUserEndedSessionRef.current = true
@@ -1377,9 +1428,13 @@ function GuestFlow({ onBack, supported }: { onBack: () => void; supported: boole
         guestTriggerTimesRef.current.push(Date.now())
         setGuestRecentTriggers30s((n) => n + 1)
         const p = getPresetById(msg.presetId)
-        if (p && canTriggerLocal) {
-          const ok = vibratePattern(p.pattern)
-          setLastHapticExecution({ at: Date.now(), success: ok, reason: 'remote' })
+        if (p) {
+          playRoutingPattern(p.pattern)
+          setLastHapticExecution({
+            at: Date.now(),
+            success: canTriggerLocal || intifaceReady,
+            reason: 'remote',
+          })
         }
         return
       }
@@ -1419,7 +1474,7 @@ function GuestFlow({ onBack, supported }: { onBack: () => void; supported: boole
             guestTriggerTimesRef.current.push(Date.now())
             setGuestRecentTriggers30s((n) => n + 1)
             const p = getPresetById(ev.presetId)
-            if (p && supported) vibratePattern(p.pattern)
+            if (p) playRoutingPattern(p.pattern)
           }, delay0 + (ev.offsetMs - initial))
           guestTimeouts.current.push(t)
         }
@@ -1448,12 +1503,18 @@ function GuestFlow({ onBack, supported }: { onBack: () => void; supported: boole
           window.clearInterval(sustainTimerRef.current)
           sustainTimerRef.current = null
         }
-        if (msg.level > 0 && canTriggerLocal) {
+        if (msg.level <= 0) {
+          stopAllHardwareOutputs()
+        } else if (canTriggerLocal || intifaceReady) {
           const onMs = Math.max(20, Math.round((msg.level / 100) * 240))
           const offMs = Math.max(35, 180 - Math.round((msg.level / 100) * 120))
           const run = () => {
-            const ok = vibratePattern([onMs, offMs])
-            setLastHapticExecution({ at: Date.now(), success: ok, reason: 'remote' })
+            pulseRoutingSustain(msg.level)
+            setLastHapticExecution({
+              at: Date.now(),
+              success: canTriggerLocal || intifaceReady,
+              reason: 'remote',
+            })
           }
           run()
           sustainTimerRef.current = window.setInterval(run, onMs + offMs)
@@ -1476,7 +1537,7 @@ function GuestFlow({ onBack, supported }: { onBack: () => void; supported: boole
         setError('Host ended the connection. You can reconnect if they start a new session.')
       }
     },
-    [canTriggerLocal, endGuestConnection, stopAllGuestActions, supported],
+    [canTriggerLocal, endGuestConnection, intifaceReady, playRoutingPattern, pulseRoutingSustain, stopAllGuestActions, stopAllHardwareOutputs],
   )
 
   useEffect(() => {
@@ -1688,10 +1749,10 @@ function GuestFlow({ onBack, supported }: { onBack: () => void; supported: boole
   }, [joinHostSession, sessionInput])
 
   const runIntensityProbe = useCallback(() => {
-    // Web APIs cannot detect system vibration intensity directly; this is user-confirmed.
-    const ok = canTriggerLocal ? vibratePattern([90, 45, 120]) : false
+    const ok = canTriggerLocal || intifaceReady
+    if (ok) playRoutingPattern([90, 45, 120])
     if (!ok) setIntensityCheck('weak')
-  }, [canTriggerLocal])
+  }, [canTriggerLocal, intifaceReady, playRoutingPattern])
 
   useEffect(() => {
     try {
@@ -1883,14 +1944,23 @@ function GuestFlow({ onBack, supported }: { onBack: () => void; supported: boole
               </div>
             )}
             <p className="muted">
-              Signal received: <strong>{lastHostMessage ? 'Yes' : 'No'}</strong> | Haptics path:{' '}
-              <strong>{supported ? 'Physical vibration' : bestEffort ? 'Best effort simulation' : 'Unavailable'}</strong>
+              Signal received: <strong>{lastHostMessage ? 'Yes' : 'No'}</strong> | Outputs:{' '}
+              <strong>
+                {[
+                  supported || bestEffort ? 'Phone' : null,
+                  intifaceReady ? 'Bluetooth (Intiface)' : null,
+                ]
+                  .filter(Boolean)
+                  .join(' · ') || 'none configured'}
+              </strong>
             </p>
             {lastHapticExecution && (
               <p className={lastHapticExecution.success ? 'ok' : 'warn'}>
                 Last haptic execution ({lastHapticExecution.reason}) at{' '}
                 {new Date(lastHapticExecution.at).toLocaleTimeString()}:{' '}
-                {lastHapticExecution.success ? 'vibrate() accepted' : 'vibrate() returned false'}
+                {lastHapticExecution.success
+                  ? 'output routed (see Haptics output settings)'
+                  : 'no usable output routes'}
               </p>
             )}
             <div className="row wrap">
@@ -1898,10 +1968,11 @@ function GuestFlow({ onBack, supported }: { onBack: () => void; supported: boole
                 type="button"
                 className="btn"
                 onClick={() => {
-                  const ok = canTriggerLocal ? vibratePattern([25, 40, 25]) : false
+                  const ok = canTriggerLocal || intifaceReady
+                  if (ok) playRoutingPattern([25, 40, 25])
                   setLastHapticExecution({ at: Date.now(), success: ok, reason: 'prime' })
                 }}
-                disabled={!canTriggerLocal}
+                disabled={!canTriggerLocal && !intifaceReady}
               >
                 Prime haptics (tap once)
               </button>
@@ -1917,11 +1988,16 @@ function GuestFlow({ onBack, supported }: { onBack: () => void; supported: boole
               : 'none yet'}
           </p>
           {lastHostMessage?.kind === 'sustain' && <p className="muted">Current sustained level: {guestSustainLevel}</p>}
-          {!supported && (
+          {!supported && !(bestEffort || intifaceReady) && (
             <p className="warn">
-              {bestEffort
-                ? 'Physical haptics are best effort on this iOS browser. Pattern timing is simulated where direct vibration is unavailable.'
-                : 'Vibration API not available—patterns will not be felt here.'}
+              Phone vibration API is not available here. Configure Intiface/Bluetooth in the Haptics output bar for
+              hardware feedback.
+            </p>
+          )}
+          {!supported && bestEffort && (
+            <p className="callout">
+              Physical phone haptics are best effort in this Safari-based browser—timing is mirrored visually unless you add
+              Bluetooth hardware via Intiface.
             </p>
           )}
           {modeView === 'instant' && <p className="muted">Waiting for instant taps from the host…</p>}

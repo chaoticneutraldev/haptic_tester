@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { CURVE_PRESETS, HAPTIC_PRESETS, getPresetById } from '../lib/hapticPresets'
+import { useHapticOutput } from '../lib/hapticOutputContext'
 import { RECOMMENDED_PATTERN_DURATION_MS, RECOMMENDED_PATTERN_EVENTS } from '../lib/recommendedPattern'
-import { bestEffortHapticsMode, stopVibrate, vibratePattern, vibrateSupported } from '../lib/vibrate'
+import { bestEffortHapticsMode, vibrateSupported } from '../lib/vibrate'
 
 const STORAGE_KEY = 'haptic-tester-custom-pattern'
 const INTENSITY_CHECK_STORAGE_KEY = 'haptic-tester-intensity-check'
@@ -35,7 +36,8 @@ function loadIntensityCheck(): 'unknown' | 'felt' | 'weak' {
 }
 
 function LocalHapticsFooter({
-  supported,
+  phoneVibrateSupported,
+  intifaceReady,
   mode,
   playing,
   playheadMs,
@@ -45,7 +47,8 @@ function LocalHapticsFooter({
   lastActionAt,
   lastAction,
 }: {
-  supported: boolean
+  phoneVibrateSupported: boolean
+  intifaceReady: boolean
   mode: 'instant' | 'pattern' | 'sustained'
   playing: boolean
   playheadMs: number
@@ -62,12 +65,16 @@ function LocalHapticsFooter({
   }, [])
   const sinceLastAction = lastActionAt ? `${Math.max(0, Math.floor((now - lastActionAt) / 1000))}s` : 'n/a'
 
+  const ready = phoneVibrateSupported || intifaceReady
+
   return (
     <div className="pairing-footer">
       <span>
         <strong>Local haptics</strong>
       </span>
-      <span>Supported: {supported ? 'Yes' : 'No'}</span>
+      <span>Phone API: {phoneVibrateSupported ? 'Yes' : 'No'}</span>
+      <span>Bluetooth: {intifaceReady ? 'Ready' : 'No'}</span>
+      <span>Ready total: {ready ? 'Yes' : 'No'}</span>
       <span>Mode: {mode}</span>
       <span>Pattern: {playing ? 'Playing' : 'Idle'}</span>
       <span>
@@ -85,6 +92,8 @@ export function HapticsTesterPage() {
   const supported = vibrateSupported()
   const bestEffort = bestEffortHapticsMode()
   const canTrigger = supported || bestEffort
+  const { playRoutingPattern, pulseRoutingSustain, stopAllHardwareOutputs, intifaceReady } = useHapticOutput()
+  const effectiveTrigger = canTrigger || intifaceReady
   const [mode, setMode] = useState<'instant' | 'pattern' | 'sustained'>('instant')
   const [customText, setCustomText] = useState(loadStoredPattern)
   const [customError, setCustomError] = useState<string | null>(null)
@@ -120,11 +129,11 @@ export function HapticsTesterPage() {
     (id: string) => {
       const p = getPresetById(id)
       if (!p) return
-      vibratePattern(p.pattern)
+      playRoutingPattern(p.pattern)
       setLastActionAt(Date.now())
       setLastAction(`Instant: ${p.name}`)
     },
-    [],
+    [playRoutingPattern],
   )
 
   const playCustom = useCallback(() => {
@@ -135,10 +144,10 @@ export function HapticsTesterPage() {
     }
     setCustomError(null)
     persist(customText)
-    vibratePattern(p)
+    playRoutingPattern(p)
     setLastActionAt(Date.now())
     setLastAction('Instant: Custom curve')
-  }, [customText, persist])
+  }, [customText, persist, playRoutingPattern])
 
   const applyCurvePreset = useCallback(
     (name: keyof typeof CURVE_PRESETS) => {
@@ -146,12 +155,12 @@ export function HapticsTesterPage() {
       const text = pat.join(', ')
       setCustomText(text)
       persist(text)
-      vibratePattern(pat)
+      playRoutingPattern(pat)
       setCustomError(null)
       setLastActionAt(Date.now())
       setLastAction(`Instant preset: ${name}`)
     },
-    [persist],
+    [persist, playRoutingPattern],
   )
 
   const grouped = useMemo(() => {
@@ -186,10 +195,10 @@ export function HapticsTesterPage() {
     if (sustainTimerRef.current) window.clearInterval(sustainTimerRef.current)
     sustainTimerRef.current = null
     setSustainLevel(0)
-    stopVibrate()
+    stopAllHardwareOutputs()
     setLastActionAt(Date.now())
     setLastAction('Stop all')
-  }, [clearPatternTimers])
+  }, [clearPatternTimers, stopAllHardwareOutputs])
 
   const schedulePatternCycle = useCallback(
     (initial: number) => {
@@ -203,7 +212,7 @@ export function HapticsTesterPage() {
         const t = window.setTimeout(() => {
           const p = getPresetById(ev.presetId)
           if (p) {
-            vibratePattern(p.pattern)
+            playRoutingPattern(p.pattern)
             setLastActionAt(Date.now())
             setLastAction(`Pattern: ${p.name}`)
           }
@@ -211,7 +220,7 @@ export function HapticsTesterPage() {
         patternTimeoutsRef.current.push(t)
       }
     },
-    [clearPatternTimers, patternEvents],
+    [clearPatternTimers, patternEvents, playRoutingPattern],
   )
 
   const startPattern = useCallback(() => {
@@ -306,16 +315,20 @@ export function HapticsTesterPage() {
       window.clearInterval(sustainTimerRef.current)
       sustainTimerRef.current = null
     }
-    if (!supported || clamped === 0) {
-      stopVibrate()
+    if (clamped === 0) {
+      stopAllHardwareOutputs()
       setLastActionAt(Date.now())
       setLastAction('Sustained: Off')
+      return
+    }
+    if (!canTrigger && !intifaceReady) {
+      stopAllHardwareOutputs()
       return
     }
     const onMs = Math.max(20, Math.round((clamped / 100) * 240))
     const offMs = Math.max(35, 180 - Math.round((clamped / 100) * 120))
     const run = () => {
-      vibratePattern([onMs, offMs])
+      pulseRoutingSustain(clamped)
       setLastActionAt(Date.now())
       setLastAction(`Sustained: ${clamped}`)
     }
@@ -324,10 +337,12 @@ export function HapticsTesterPage() {
   }
 
   const runIntensityProbe = useCallback(() => {
-    // Web APIs cannot read system vibration intensity, so use a user-confirmed pulse check.
-    const ok = vibratePattern([90, 45, 120])
-    if (!ok) setIntensityCheck('weak')
-  }, [])
+    if (!canTrigger && !intifaceReady) {
+      setIntensityCheck('weak')
+      return
+    }
+    playRoutingPattern([90, 45, 120])
+  }, [canTrigger, intifaceReady, playRoutingPattern])
 
   useEffect(() => {
     try {
@@ -417,7 +432,7 @@ export function HapticsTesterPage() {
                     type="button"
                     className="preset-cell"
                     onClick={() => playPreset(p.id)}
-                    disabled={!canTrigger}
+                    disabled={!effectiveTrigger}
                   >
                     <span className="preset-name">{p.name}</span>
                     <span className="preset-pattern">{p.pattern.join(' · ')} ms</span>
@@ -445,20 +460,20 @@ export function HapticsTesterPage() {
             </label>
             {customError && <p className="warn">{customError}</p>}
             <div className="row wrap">
-              <button type="button" className="btn btn-primary" onClick={playCustom} disabled={!canTrigger}>
+              <button type="button" className="btn btn-primary" onClick={playCustom} disabled={!effectiveTrigger}>
                 Play custom
               </button>
-              <button type="button" className="btn" onClick={() => applyCurvePreset('game-progress')} disabled={!canTrigger}>
+              <button type="button" className="btn" onClick={() => applyCurvePreset('game-progress')} disabled={!effectiveTrigger}>
                 Preset: game progress
               </button>
-              <button type="button" className="btn" onClick={() => applyCurvePreset('footsteps')} disabled={!canTrigger}>
+              <button type="button" className="btn" onClick={() => applyCurvePreset('footsteps')} disabled={!effectiveTrigger}>
                 Preset: footsteps
               </button>
               <button
                 type="button"
                 className="btn"
                 onClick={() => applyCurvePreset('urgent-attention')}
-                disabled={!canTrigger}
+                disabled={!effectiveTrigger}
               >
                 Preset: urgent attention
               </button>
@@ -503,7 +518,7 @@ export function HapticsTesterPage() {
               <input type="checkbox" checked={loopMode} onChange={(e) => setLoopMode(e.target.checked)} />
             </label>
             {!playing ? (
-              <button type="button" className="btn btn-primary" onClick={startPattern} disabled={!canTrigger}>
+              <button type="button" className="btn btn-primary" onClick={startPattern} disabled={!effectiveTrigger}>
                 Play
               </button>
             ) : (
@@ -582,7 +597,7 @@ export function HapticsTesterPage() {
           <h2>Sustained mode</h2>
           <p className="muted">Set a continuous local buzz level. 0 turns sustained buzz off.</p>
           <div className="row wrap">
-            <button type="button" className="btn" onClick={() => sendSustainLevel(sustainLevel - 10)} disabled={!canTrigger}>
+            <button type="button" className="btn" onClick={() => sendSustainLevel(sustainLevel - 10)} disabled={!effectiveTrigger}>
               -10
             </button>
             <input
@@ -592,28 +607,29 @@ export function HapticsTesterPage() {
               step={1}
               value={sustainLevel}
               onChange={(e) => sendSustainLevel(Number(e.target.value))}
-              disabled={!canTrigger}
+              disabled={!effectiveTrigger}
             />
-            <button type="button" className="btn" onClick={() => sendSustainLevel(sustainLevel + 10)} disabled={!canTrigger}>
+            <button type="button" className="btn" onClick={() => sendSustainLevel(sustainLevel + 10)} disabled={!effectiveTrigger}>
               +10
             </button>
             <span className="pill">Level {sustainLevel}</span>
           </div>
           <div className="row wrap">
-            <button type="button" className="btn" onClick={() => sendSustainLevel(0)} disabled={!canTrigger}>
+            <button type="button" className="btn" onClick={() => sendSustainLevel(0)} disabled={!effectiveTrigger}>
               Stop
             </button>
-            <button type="button" className="btn btn-primary" onClick={() => sendSustainLevel(60)} disabled={!canTrigger}>
+            <button type="button" className="btn btn-primary" onClick={() => sendSustainLevel(60)} disabled={!effectiveTrigger}>
               Medium
             </button>
-            <button type="button" className="btn" onClick={() => sendSustainLevel(90)} disabled={!canTrigger}>
+            <button type="button" className="btn" onClick={() => sendSustainLevel(90)} disabled={!effectiveTrigger}>
               Strong
             </button>
           </div>
         </section>
       )}
       <LocalHapticsFooter
-        supported={canTrigger}
+        phoneVibrateSupported={canTrigger}
+        intifaceReady={intifaceReady}
         mode={mode}
         playing={playing}
         playheadMs={playheadMs}
