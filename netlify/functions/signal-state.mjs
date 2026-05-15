@@ -1,4 +1,4 @@
-import { getSession, json, putAnswer, putOffer } from './_signal-store.mjs'
+import { getSession, json, putAnswer, putOffer, putNextShortcode } from './_signal-store.mjs'
 
 function codeFromPath(path) {
   const parts = String(path ?? '')
@@ -23,6 +23,9 @@ export async function handler(event) {
         offer: session.offer,
         answer: session.answer,
         matchedAt: session.matchedAt,
+        matchExpiresAt: session.matchExpiresAt ?? null,
+        activeExpiresAt: session.activeExpiresAt ?? null,
+        nextShortcode: session.nextShortcode ?? null,
       })
     }
 
@@ -38,16 +41,41 @@ export async function handler(event) {
           return json(400, { error: 'Invalid offer payload' })
         }
         const s = await putOffer(code, body.payload)
-        return json(200, { code: s.code, status: s.status, hasOffer: true, hasAnswer: Boolean(s.answer) })
+        return json(200, {
+          code: s.code,
+          status: s.status,
+          hasOffer: true,
+          hasAnswer: Boolean(s.answer),
+          matchExpiresAt: s.matchExpiresAt ?? null,
+        })
       }
       if (body.kind === 'answer') {
         if (typeof body.payload !== 'string' || body.payload.length < 10) {
           return json(400, { error: 'Invalid answer payload' })
         }
         const s = await putAnswer(code, body.payload)
-        return json(200, { code: s.code, status: s.status, hasOffer: true, hasAnswer: true, matchedAt: s.matchedAt })
+        return json(200, {
+          code: s.code,
+          status: s.status,
+          hasOffer: true,
+          hasAnswer: true,
+          matchedAt: s.matchedAt,
+          activeExpiresAt: s.activeExpiresAt ?? null,
+        })
       }
-      return json(400, { error: 'kind must be "offer" or "answer"' })
+      if (body.kind === 'linkNext') {
+        if (typeof body.nextCode !== 'string' || body.nextCode.length < 5) {
+          return json(400, { error: 'Invalid nextCode' })
+        }
+        const s = await putNextShortcode(code, body.nextCode)
+        return json(200, {
+          code: s.code,
+          status: s.status,
+          nextShortcode: s.nextShortcode,
+          activeExpiresAt: s.activeExpiresAt ?? null,
+        })
+      }
+      return json(400, { error: 'kind must be "offer", "answer", or "linkNext"' })
     }
 
     return json(405, { error: 'Method not allowed' })

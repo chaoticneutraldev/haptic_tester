@@ -5,7 +5,13 @@ import { RECOMMENDED_PATTERN_DURATION_MS, RECOMMENDED_PATTERN_EVENTS } from '../
 import { QR_SAFE_MAX_LEN } from '../lib/signaling'
 import { SIGNALING_COMPACT_PREFIX } from '../lib/signalingCodec'
 import { generateSessionId } from '../lib/sessionId'
-import { createSignalSession, getSignalState, postSignalAnswer, postSignalOffer } from '../lib/signalApi'
+import {
+  createSignalSession,
+  getSignalState,
+  postLinkNextShortcode,
+  postSignalAnswer,
+  postSignalOffer,
+} from '../lib/signalApi'
 import {
   hostApplyAnswer,
   hostCreateOffer,
@@ -254,10 +260,15 @@ type HostGuest = {
   deliveryDots: DeliveryDot[]
   heartbeat: GuestHeartbeat | null
   sessionStartedAt: number | null
+  /** Data channel dropped unexpectedly while paired (not user-ended). */
+  linkLost: boolean
+  /** Host published a replacement offer and linked it from the guest’s old code. */
+  hostReconnectWaiting: boolean
 }
 
 function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolean }) {
-  const MATCH_TTL_MS = 15 * 60 * 1000
+  /** Only used if the server omits `matchExpiresAt` (e.g. older signaling rows). */
+  const MATCH_TTL_MS_FALLBACK = 2 * 60 * 60 * 1000
   const sessionId = useMemo(() => generateSessionId(), [])
   const [mode, setMode] = useState<'instant' | 'pattern' | 'sustained'>('instant')
   const [patterns, setPatterns] = useState<HostPatternConfig[]>(HOST_PATTERN_PRESETS)
@@ -277,6 +288,8 @@ function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolea
   const channelsRef = useRef<Record<string, RTCDataChannel>>({})
   const offerGenerationRef = useRef<Record<string, number>>({})
   const guestCounterRef = useRef(1)
+  /** Ignore data-channel close while intentionally rotating or removing a guest PC. */
+  const hostSuppressDisconnectRef = useRef<Record<string, boolean>>({})
 
   const connectedGuests = useMemo(() => guests.filter((g) => g.step === 'connected'), [guests])
   const compactFooter = forceCompactFooter || connectedGuests.length >= 6
@@ -305,6 +318,7 @@ function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolea
 
   const removeGuest = useCallback(
     (guestId: string, notifyGuest: boolean) => {
+      hostSuppressDisconnectRef.current[guestId] = true
       const ch = channelsRef.current[guestId]
       if (notifyGuest && ch && ch.readyState === 'open') {
         ch.send(stringifyDcMessage({ v: 1, t: 'disconnect' }))
@@ -314,6 +328,7 @@ function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolea
       delete channelsRef.current[guestId]
       delete pcsRef.current[guestId]
       delete offerGenerationRef.current[guestId]
+      delete hostSuppressDisconnectRef.current[guestId]
       setGuests((prev) => prev.filter((g) => g.id !== guestId))
     },
     [setGuests],
@@ -338,13 +353,94 @@ function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolea
       deliveryDots: [],
       heartbeat: null,
       sessionStartedAt: null,
+      linkLost: false,
+      hostReconnectWaiting: false,
     }
     setGuests((prev) => [...prev, guest])
     return id
   }, [])
 
+  const wireHostChannel = useCallback(
+    (guestId: string, pc: RTCPeerConnection, channel: RTCDataChannel, onGuestDisconnectMessage: () => void) => {
+      const pushNet = () => {
+        updateGuest(guestId, (g) => ({
+          ...g,
+          netSnap: {
+            ice: pc.iceConnectionState,
+            connection: pc.connectionState,
+            dataChannel: channel.readyState,
+          },
+        }))
+      }
+      const markLinkLost = () => {
+        if (hostSuppressDisconnectRef.current[guestId]) return
+        updateGuest(guestId, (g) =>
+          g.step === 'connected' ? { ...g, linkLost: true, hostReconnectWaiting: false } : g,
+        )
+      }
+      channel.onmessage = (ev) => {
+        const msg = parseDcMessage(typeof ev.data === 'string' ? ev.data : '')
+        if (!msg) return
+        if (msg.t === 'disconnect') {
+          onGuestDisconnectMessage()
+          return
+        }
+        if (msg.t === 'heartbeat') {
+          updateGuest(guestId, (g) => ({
+            ...g,
+            heartbeat: {
+              sentAt: msg.sentAt,
+              sessionStartedAt: msg.sessionStartedAt,
+              sustainedLevel: msg.sustainedLevel,
+              recentTriggers30s: msg.recentTriggers30s,
+              lockedMode: msg.lockedMode,
+            },
+          }))
+          return
+        }
+        if (msg.t === 'ack') {
+          updateGuest(guestId, (g) => ({
+            ...g,
+            lastGuestAck: { kind: msg.kind, at: msg.at },
+            deliveryDots:
+              msg.kind === 'instant' && typeof msg.seq === 'number'
+                ? g.deliveryDots.map((d) => (d.seq === msg.seq ? { ...d, status: 'ack' } : d))
+                : g.deliveryDots,
+          }))
+        }
+      }
+      pc.addEventListener('iceconnectionstatechange', () => {
+        pushNet()
+        if (pc.iceConnectionState === 'failed') markLinkLost()
+      })
+      pc.addEventListener('connectionstatechange', () => {
+        pushNet()
+        if (pc.connectionState === 'failed' || pc.connectionState === 'closed') markLinkLost()
+      })
+      channel.addEventListener('open', pushNet)
+      channel.addEventListener('close', markLinkLost)
+      pushNet()
+    },
+    [updateGuest],
+  )
+
+  const finalizeHostChannelOpen = useCallback(
+    (guestId: string) => {
+      updateGuest(guestId, (g) => ({
+        ...g,
+        step: 'connected',
+        hostHandoff: false,
+        linkLost: false,
+        hostReconnectWaiting: false,
+        sessionStartedAt: Date.now(),
+      }))
+    },
+    [updateGuest],
+  )
+
   const generateOfferForGuest = useCallback(
     async (guestId: string) => {
+      hostSuppressDisconnectRef.current[guestId] = true
       updateGuest(guestId, (g) => ({
         ...g,
         busy: true,
@@ -353,6 +449,8 @@ function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolea
         answerInput: '',
         offerExpiresAt: null,
         netSnap: null,
+        linkLost: false,
+        hostReconnectWaiting: false,
       }))
       const gen = (offerGenerationRef.current[guestId] ?? 0) + 1
       offerGenerationRef.current[guestId] = gen
@@ -365,82 +463,27 @@ function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolea
         }
         pcsRef.current[guestId] = pc
         channelsRef.current[guestId] = channel
-        const pushNet = () => {
-          updateGuest(guestId, (g) => ({
-            ...g,
-            netSnap: {
-              ice: pc.iceConnectionState,
-              connection: pc.connectionState,
-              dataChannel: channel.readyState,
-            },
-          }))
-        }
-        const onDisconnect = () => {
+        wireHostChannel(guestId, pc, channel, () => {
           removeGuest(guestId, false)
-        }
-        channel.onmessage = (ev) => {
-          const msg = parseDcMessage(typeof ev.data === 'string' ? ev.data : '')
-          if (!msg) return
-          if (msg.t === 'disconnect') {
-            onDisconnect()
-            return
-          }
-          if (msg.t === 'heartbeat') {
-            updateGuest(guestId, (g) => ({
-              ...g,
-              heartbeat: {
-                sentAt: msg.sentAt,
-                sessionStartedAt: msg.sessionStartedAt,
-                sustainedLevel: msg.sustainedLevel,
-                recentTriggers30s: msg.recentTriggers30s,
-                lockedMode: msg.lockedMode,
-              },
-            }))
-            return
-          }
-          if (msg.t === 'ack') {
-            updateGuest(guestId, (g) => ({
-              ...g,
-              lastGuestAck: { kind: msg.kind, at: msg.at },
-              deliveryDots:
-                msg.kind === 'instant' && typeof msg.seq === 'number'
-                  ? g.deliveryDots.map((d) => (d.seq === msg.seq ? { ...d, status: 'ack' } : d))
-                  : g.deliveryDots,
-            }))
-          }
-        }
-        pc.addEventListener('iceconnectionstatechange', pushNet)
-        pc.addEventListener('connectionstatechange', pushNet)
-        channel.addEventListener('open', pushNet)
-        pushNet()
+        })
         const signal = await createSignalSession()
-        await postSignalOffer(signal.code, offerText)
+        const posted = await postSignalOffer(signal.code, offerText)
+        const expiresMs = posted.matchExpiresAt ? Date.parse(posted.matchExpiresAt) : Date.now() + MATCH_TTL_MS_FALLBACK
         updateGuest(guestId, (g) => ({
           ...g,
           offerText,
           pairCode: signal.code,
-          offerExpiresAt: Date.now() + MATCH_TTL_MS,
+          offerExpiresAt: Number.isNaN(expiresMs) ? Date.now() + MATCH_TTL_MS_FALLBACK : expiresMs,
           step: 'offer-ready',
           busy: false,
           hostHandoff: false,
           error: null,
         }))
         channel.onopen = () => {
-          pushNet()
-          updateGuest(guestId, (g) => ({
-            ...g,
-            step: 'connected',
-            hostHandoff: false,
-            sessionStartedAt: Date.now(),
-          }))
+          finalizeHostChannelOpen(guestId)
         }
         if (channel.readyState === 'open') {
-          updateGuest(guestId, (g) => ({
-            ...g,
-            step: 'connected',
-            hostHandoff: false,
-            sessionStartedAt: Date.now(),
-          }))
+          finalizeHostChannelOpen(guestId)
         }
       } catch (e) {
         updateGuest(guestId, (g) => ({
@@ -448,9 +491,80 @@ function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolea
           busy: false,
           error: e instanceof Error ? e.message : 'Failed to create offer',
         }))
+      } finally {
+        hostSuppressDisconnectRef.current[guestId] = false
       }
     },
-    [MATCH_TTL_MS, removeGuest, updateGuest],
+    [MATCH_TTL_MS_FALLBACK, finalizeHostChannelOpen, removeGuest, updateGuest, wireHostChannel],
+  )
+
+  const reconnectHostGuest = useCallback(
+    async (guestId: string) => {
+      const prevGuest = guests.find((g) => g.id === guestId)
+      const previousPairCode = prevGuest?.pairCode ?? ''
+      if (previousPairCode.length < 5) {
+        updateGuest(guestId, (g) => ({ ...g, error: 'No prior pair code stored; use Generate new offer.' }))
+        return
+      }
+      hostSuppressDisconnectRef.current[guestId] = true
+      updateGuest(guestId, (g) => ({
+        ...g,
+        busy: true,
+        error: null,
+        linkLost: false,
+        hostReconnectWaiting: true,
+        hostHandoff: false,
+        answerInput: '',
+        offerExpiresAt: null,
+        netSnap: null,
+        step: 'offer-ready',
+      }))
+      const gen = (offerGenerationRef.current[guestId] ?? 0) + 1
+      offerGenerationRef.current[guestId] = gen
+      try {
+        pcsRef.current[guestId]?.close()
+        const { pc, channel, offerText } = await hostCreateOffer()
+        if (offerGenerationRef.current[guestId] !== gen) {
+          pc.close()
+          return
+        }
+        pcsRef.current[guestId] = pc
+        channelsRef.current[guestId] = channel
+        wireHostChannel(guestId, pc, channel, () => {
+          removeGuest(guestId, false)
+        })
+        const signal = await createSignalSession()
+        const posted = await postSignalOffer(signal.code, offerText)
+        await postLinkNextShortcode(previousPairCode, signal.code)
+        const expiresMs = posted.matchExpiresAt ? Date.parse(posted.matchExpiresAt) : Date.now() + MATCH_TTL_MS_FALLBACK
+        updateGuest(guestId, (g) => ({
+          ...g,
+          offerText,
+          pairCode: signal.code,
+          offerExpiresAt: Number.isNaN(expiresMs) ? Date.now() + MATCH_TTL_MS_FALLBACK : expiresMs,
+          step: 'offer-ready',
+          busy: false,
+          hostHandoff: false,
+          error: null,
+        }))
+        channel.onopen = () => {
+          finalizeHostChannelOpen(guestId)
+        }
+        if (channel.readyState === 'open') {
+          finalizeHostChannelOpen(guestId)
+        }
+      } catch (e) {
+        updateGuest(guestId, (g) => ({
+          ...g,
+          busy: false,
+          hostReconnectWaiting: false,
+          error: e instanceof Error ? e.message : 'Reconnect failed',
+        }))
+      } finally {
+        hostSuppressDisconnectRef.current[guestId] = false
+      }
+    },
+    [MATCH_TTL_MS_FALLBACK, finalizeHostChannelOpen, guests, removeGuest, updateGuest, wireHostChannel],
   )
 
   const applyAnswerForGuest = useCallback(
@@ -575,6 +689,12 @@ function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolea
         waiting.map(async (guest) => {
           try {
             const s = await getSignalState(guest.pairCode)
+            if (s.matchExpiresAt) {
+              const ms = Date.parse(s.matchExpiresAt)
+              if (!Number.isNaN(ms)) {
+                updateGuest(guest.id, (g) => ({ ...g, offerExpiresAt: ms }))
+              }
+            }
             if (s.answer) {
               updateGuest(guest.id, (g) => (g.answerInput ? g : { ...g, answerInput: s.answer ?? '' }))
             }
@@ -732,7 +852,22 @@ function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolea
               <div className="row spread">
                 <h3>{guest.label}</h3>
                 <div className="row wrap">
-                  {guest.step === 'connected' && (
+                  {guest.linkLost && (
+                    <>
+                      <button
+                        type="button"
+                        className="btn btn-primary"
+                        disabled={guest.busy}
+                        onClick={() => void reconnectHostGuest(guest.id)}
+                      >
+                        Reconnect session
+                      </button>
+                      <button type="button" className="btn btn-ghost" onClick={() => removeGuest(guest.id, false)}>
+                        Remove guest
+                      </button>
+                    </>
+                  )}
+                  {guest.step === 'connected' && !guest.linkLost && (
                     <button type="button" className="btn btn-danger" onClick={() => removeGuest(guest.id, true)}>
                       End connection
                     </button>
@@ -749,6 +884,19 @@ function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolea
                   )}
                 </div>
               </div>
+              {guest.linkLost && (
+                <p className="warn">
+                  Data channel or transport dropped unexpectedly. Tap <strong>Reconnect session</strong> to publish a new
+                  pair code linked from the guest’s previous code, or remove this guest and add a new one.
+                </p>
+              )}
+              {guest.hostReconnectWaiting && guest.step !== 'connected' && (
+                <p className="muted">
+                  Reconnect offer published on the server. New pair code: <strong>{guest.pairCode}</strong>. Ask the guest
+                  to use <strong>Reconnect</strong> on their device (they should poll their <em>old</em> code first), then
+                  apply the new answer when it arrives.
+                </p>
+              )}
               {guest.pairCode && (
                 <p className="session-code">
                   Pair code: <strong>{guest.pairCode}</strong> (share this 5-character code)
@@ -1085,6 +1233,9 @@ function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolea
   )
 }
 
+const GUEST_LINK_WATCHDOG_MS = 60_000
+const RECONNECT_HANDOFF_COOLDOWN_SEC = 10
+
 function GuestFlow({ onBack, supported }: { onBack: () => void; supported: boolean }) {
   const bestEffort = bestEffortHapticsMode()
   const canTriggerLocal = supported || bestEffort
@@ -1129,6 +1280,20 @@ function GuestFlow({ onBack, supported }: { onBack: () => void; supported: boole
   const hasPairCode = sessionInput.trim().length >= 5
   const [guestLocked, setGuestLocked] = useState(false)
   const [intensityCheck, setIntensityCheck] = useState<'unknown' | 'felt' | 'weak'>(loadGuestIntensityCheck)
+  const [showReconnectPanel, setShowReconnectPanel] = useState(false)
+  const [reconnectCooldownSec, setReconnectCooldownSec] = useState(0)
+  const [emergencyStopOpen, setEmergencyStopOpen] = useState(false)
+  const [savedPairCodeLabel, setSavedPairCodeLabel] = useState<string | null>(null)
+
+  const guestUserEndedSessionRef = useRef(false)
+  const lastShortPairingCodeRef = useRef<string | null>(null)
+  const transportDeadRef = useRef(false)
+
+  useEffect(() => {
+    if (reconnectCooldownSec <= 0) return
+    const t = window.setInterval(() => setReconnectCooldownSec((c) => Math.max(0, c - 1)), 1000)
+    return () => window.clearInterval(t)
+  }, [reconnectCooldownSec])
 
   const clearGuestSched = () => {
     guestTimeouts.current.forEach((id) => window.clearTimeout(id))
@@ -1147,7 +1312,8 @@ function GuestFlow({ onBack, supported }: { onBack: () => void; supported: boole
     stopVibrate()
   }, [])
 
-  const endGuestConnection = useCallback((notifyHost: boolean) => {
+  const endGuestConnection = useCallback((notifyHost: boolean, intentionalGuestEnd = false) => {
+    if (intentionalGuestEnd) guestUserEndedSessionRef.current = true
     if (notifyHost) {
       const ch = channelRef.current
       if (ch && ch.readyState === 'open') {
@@ -1179,6 +1345,8 @@ function GuestFlow({ onBack, supported }: { onBack: () => void; supported: boole
     setGuestSafetyStopped(false)
     guestSessionStartedAtRef.current = null
     guestTriggerTimesRef.current = []
+    setShowReconnectPanel(false)
+    setEmergencyStopOpen(false)
   }, [])
 
   useEffect(() => {
@@ -1303,8 +1471,9 @@ function GuestFlow({ onBack, supported }: { onBack: () => void; supported: boole
       }
       if (msg.t === 'disconnect') {
         lastHostActivityAtRef.current = Date.now()
-        endGuestConnection(false)
-        setError('Host ended the connection.')
+        endGuestConnection(false, false)
+        setShowReconnectPanel(true)
+        setError('Host ended the connection. You can reconnect if they start a new session.')
       }
     },
     [canTriggerLocal, endGuestConnection, stopAllGuestActions, supported],
@@ -1376,14 +1545,14 @@ function GuestFlow({ onBack, supported }: { onBack: () => void; supported: boole
 
   useEffect(() => {
     if (!connected) return
-    const WATCHDOG_MS = 12_000
     const timer = window.setInterval(() => {
       const last = lastHostActivityAtRef.current
       if (!last) return
-      if (Date.now() - last > WATCHDOG_MS && !guestSafetyStopped) {
+      if (Date.now() - last > GUEST_LINK_WATCHDOG_MS && !guestSafetyStopped) {
         stopAllGuestActions()
         setGuestSafetyStopped(true)
         setError('Safety stop: host connection lost; haptics halted.')
+        setShowReconnectPanel(true)
       }
     }, 1000)
     return () => window.clearInterval(timer)
@@ -1397,72 +1566,126 @@ function GuestFlow({ onBack, supported }: { onBack: () => void; supported: boole
     guestLockedRef.current = guestLocked
   }, [guestLocked])
 
-  const createAnswer = async () => {
-    setError(null)
-    setGuestNetSnap(null)
-    setBusy(true)
-    try {
-      let resolvedOffer = offerIn.trim()
-      const enteredCode = sessionInput.trim().toUpperCase()
-      if (!resolvedOffer && enteredCode.length >= 5) {
-        const s = await getSignalState(enteredCode)
-        if (!s.offer) throw new Error('Host offer is not ready for this code yet')
-        resolvedOffer = s.offer
-        setOfferIn(resolvedOffer)
-      }
-      if (!resolvedOffer) throw new Error('Paste an offer or enter a valid pair code')
-      pcRef.current?.close()
-      const { pc, answerText: ans, waitForChannel } = await guestHandleOffer(resolvedOffer)
-      pcRef.current = pc
-      setAnswerText(ans)
-      if (enteredCode.length >= 5) {
-        await postSignalAnswer(enteredCode, ans)
-      }
-
-      const pushGuestNet = () => {
-        const snap = {
-          ice: pc.iceConnectionState,
-          connection: pc.connectionState,
-          dataChannel: channelRef.current?.readyState,
-        } as const
-        setGuestNetSnap(snap)
-        if (snap.connection === 'failed' || snap.connection === 'disconnected' || snap.connection === 'closed') {
-          stopAllGuestActions()
+  const joinHostSession = useCallback(
+    async (pairCodeOverride?: string) => {
+      transportDeadRef.current = false
+      setError(null)
+      setGuestNetSnap(null)
+      setBusy(true)
+      try {
+        let resolvedOffer = offerIn.trim()
+        const enteredCode = (pairCodeOverride ?? sessionInput).trim().toUpperCase()
+        if (pairCodeOverride) setSessionInput(enteredCode)
+        if (!resolvedOffer && enteredCode.length >= 5) {
+          const s = await getSignalState(enteredCode)
+          if (!s.offer) throw new Error('Host offer is not ready for this code yet')
+          resolvedOffer = s.offer ?? ''
+          setOfferIn(resolvedOffer)
         }
-      }
-      pc.addEventListener('iceconnectionstatechange', pushGuestNet)
-      pc.addEventListener('connectionstatechange', pushGuestNet)
-      pushGuestNet()
+        if (!resolvedOffer) throw new Error('Paste an offer or enter a valid pair code')
+        pcRef.current?.close()
+        const { pc, answerText: ans, waitForChannel } = await guestHandleOffer(resolvedOffer)
+        pcRef.current = pc
+        setAnswerText(ans)
+        if (enteredCode.length >= 5) {
+          await postSignalAnswer(enteredCode, ans)
+          lastShortPairingCodeRef.current = enteredCode
+          setSavedPairCodeLabel(enteredCode)
+        }
 
-      const ch = await waitForChannel()
-      channelRef.current = ch
-      ch.addEventListener('open', () => {
+        const onUnexpectedTransportEnd = () => {
+          if (guestUserEndedSessionRef.current) {
+            guestUserEndedSessionRef.current = false
+            transportDeadRef.current = false
+            return
+          }
+          if (transportDeadRef.current) return
+          transportDeadRef.current = true
+          stopAllGuestActions()
+          try {
+            pc.close()
+          } catch {
+            /* ignore */
+          }
+          channelRef.current = null
+          pcRef.current = null
+          setConnected(false)
+          setGuestNetSnap(null)
+          setShowReconnectPanel(true)
+          setError('Connection lost. Use Reconnect below when the host is ready.')
+        }
+
+        const pushGuestNet = () => {
+          const snap = {
+            ice: pc.iceConnectionState,
+            connection: pc.connectionState,
+            dataChannel: channelRef.current?.readyState,
+          } as const
+          setGuestNetSnap(snap)
+          if (snap.connection === 'failed' || snap.connection === 'closed') {
+            stopAllGuestActions()
+            onUnexpectedTransportEnd()
+          }
+          if (snap.connection === 'disconnected') {
+            stopAllGuestActions()
+          }
+        }
+        pc.addEventListener('iceconnectionstatechange', pushGuestNet)
+        pc.addEventListener('connectionstatechange', pushGuestNet)
         pushGuestNet()
-        lastHostActivityAtRef.current = Date.now()
-        setGuestSafetyStopped(false)
-        setConnected(true)
-      })
-      ch.addEventListener('closing', () => {
-        stopAllGuestActions()
-      })
-      ch.addEventListener('close', () => {
-        stopAllGuestActions()
-      })
-      ch.addEventListener('closing', pushGuestNet)
-      pushGuestNet()
-      ch.onmessage = (ev) => handleDcMessage(typeof ev.data === 'string' ? ev.data : '')
-      if (ch.readyState === 'open') {
+
+        const ch = await waitForChannel()
+        channelRef.current = ch
+        ch.addEventListener('open', () => {
+          pushGuestNet()
+          lastHostActivityAtRef.current = Date.now()
+          setGuestSafetyStopped(false)
+          setConnected(true)
+          setShowReconnectPanel(false)
+        })
+        ch.addEventListener('close', onUnexpectedTransportEnd)
+        ch.addEventListener('closing', pushGuestNet)
         pushGuestNet()
-        lastHostActivityAtRef.current = Date.now()
-        setGuestSafetyStopped(false)
-        setConnected(true)
+        ch.onmessage = (ev) => handleDcMessage(typeof ev.data === 'string' ? ev.data : '')
+        if (ch.readyState === 'open') {
+          pushGuestNet()
+          lastHostActivityAtRef.current = Date.now()
+          setGuestSafetyStopped(false)
+          setConnected(true)
+          setShowReconnectPanel(false)
+        }
+      } catch (e) {
+        setError(e instanceof Error ? e.message : 'Failed to handle offer')
+      } finally {
+        setBusy(false)
       }
-    } catch (e) {
-      setError(e instanceof Error ? e.message : 'Failed to handle offer')
-    } finally {
-      setBusy(false)
+    },
+    [handleDcMessage, offerIn, sessionInput, stopAllGuestActions],
+  )
+
+  const createAnswer = () => void joinHostSession()
+
+  const checkReconnectHandoff = useCallback(async () => {
+    const code = lastShortPairingCodeRef.current ?? sessionInput.trim().toUpperCase()
+    if (code.length < 5) {
+      setError('Enter your previous host pair code above, or wait for the host to share a new code.')
+      setReconnectCooldownSec(RECONNECT_HANDOFF_COOLDOWN_SEC)
+      return
     }
-  }
+    try {
+      const s = await getSignalState(code)
+      if (s.nextShortcode) {
+        setOfferIn('')
+        setAnswerText('')
+        setReconnectCooldownSec(0)
+        await joinHostSession(s.nextShortcode)
+        return
+      }
+      setReconnectCooldownSec(RECONNECT_HANDOFF_COOLDOWN_SEC)
+    } catch {
+      setReconnectCooldownSec(RECONNECT_HANDOFF_COOLDOWN_SEC)
+    }
+  }, [joinHostSession, sessionInput])
 
   const runIntensityProbe = useCallback(() => {
     // Web APIs cannot detect system vibration intensity directly; this is user-confirmed.
@@ -1482,7 +1705,14 @@ function GuestFlow({ onBack, supported }: { onBack: () => void; supported: boole
     <div className="page stack guest">
       <div className="row spread">
         <h1>GUEST</h1>
-        <button type="button" className="btn btn-ghost" onClick={onBack}>
+        <button
+          type="button"
+          className="btn btn-ghost"
+          onClick={() => {
+            endGuestConnection(connected, true)
+            onBack()
+          }}
+        >
           Change role
         </button>
       </div>
@@ -1491,6 +1721,31 @@ function GuestFlow({ onBack, supported }: { onBack: () => void; supported: boole
       </p>
 
       <GuestSignalingProgress connected={connected} busy={busy} hasAnswer={Boolean(answerText)} />
+
+      {!connected && showReconnectPanel && (
+        <section className="panel stack">
+          <h2>Reconnect</h2>
+          <p className="muted">
+            This session ended without you choosing <strong>End connection</strong> or <strong>Emergency stop</strong>.
+            The host should tap <strong>Reconnect session</strong> first. Then you can poll for a new shortcode linked to
+            your previous one
+            {savedPairCodeLabel ? <> (<strong>{savedPairCodeLabel}</strong>)</> : null}.
+          </p>
+          {!savedPairCodeLabel && sessionInput.trim().length < 5 && (
+            <p className="warn">
+              If you did not use shortcode mode, wait for a new pair code from the host and enter it above instead.
+            </p>
+          )}
+          <button
+            type="button"
+            className="btn"
+            disabled={reconnectCooldownSec > 0 || busy}
+            onClick={() => void checkReconnectHandoff()}
+          >
+            {reconnectCooldownSec > 0 ? `Check again (${reconnectCooldownSec}s)` : 'Check again for new code'}
+          </button>
+        </section>
+      )}
 
       {!connected && guestNetSnap && <IcePathPanel snap={guestNetSnap} context="guest" />}
 
@@ -1566,13 +1821,41 @@ function GuestFlow({ onBack, supported }: { onBack: () => void; supported: boole
             </p>
           )}
           <div className="row wrap">
-            <button type="button" className="btn btn-danger" onClick={() => endGuestConnection(true)}>
+            <button type="button" className="btn btn-danger" onClick={() => setEmergencyStopOpen(true)}>
+              Emergency stop
+            </button>
+            <button type="button" className="btn btn-danger" onClick={() => endGuestConnection(true, true)}>
               End connection
             </button>
             <button type="button" className="btn" onClick={() => setGuestLocked((v) => !v)}>
               {guestLocked ? 'Unlock mode' : 'Locked mode'}
             </button>
           </div>
+          {emergencyStopOpen && (
+            <div className="panel stack" role="dialog" aria-labelledby="emergency-stop-title">
+              <h3 id="emergency-stop-title">Confirm emergency stop</h3>
+              <p className="warn">
+                Emergency stop immediately halts haptics and ends your session. Only continue if you need to stop right
+                away.
+              </p>
+              <div className="row wrap">
+                <button type="button" className="btn" onClick={() => setEmergencyStopOpen(false)}>
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  className="btn btn-danger"
+                  onClick={() => {
+                    setEmergencyStopOpen(false)
+                    stopAllGuestActions()
+                    endGuestConnection(true, true)
+                  }}
+                >
+                  Confirm emergency stop
+                </button>
+              </div>
+            </div>
+          )}
           <div className="panel stack">
             {canTriggerLocal && (
               <div className="panel stack">

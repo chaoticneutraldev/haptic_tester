@@ -9,6 +9,7 @@ export async function handler(event) {
       status: session.status,
       matchExpiresInSeconds: session.matchExpiresInSeconds,
       activeTtlSeconds: session.activeTtlSeconds,
+      matchExpiresAt: session.matchExpiresAt ?? null,
       createdAt: session.createdAt,
     })
   } catch (error) {

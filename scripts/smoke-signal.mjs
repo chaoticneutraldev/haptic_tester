@@ -59,7 +59,31 @@ async function run() {
   assert(afterAnswer.json?.hasAnswer === true, 'answer missing in session state')
   assert(afterAnswer.json?.answer === answerPayload, 'host did not receive guest response payload')
 
-  console.log('Shortcode signaling smoke test passed (host<->guest payload transfer + TTL state transitions).')
+  const created2 = await req('/api/signal/session', { method: 'POST' })
+  assert(created2.status === 200, 'second session create failed')
+  const code2 = created2.json?.code
+  assert(typeof code2 === 'string' && code2.length >= 5, 'invalid second shortcode')
+
+  const postOffer2 = await req(`/api/signal/state/${encodeURIComponent(code2)}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ kind: 'offer', payload: offerPayload + '_NEW' }),
+  })
+  assert(postOffer2.status === 200, 'post second offer failed')
+
+  const linkNext = await req(`/api/signal/state/${encodeURIComponent(code)}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ kind: 'linkNext', nextCode: code2 }),
+  })
+  console.log('link next shortcode ->', linkNext.status, linkNext.json)
+  assert(linkNext.status === 200, 'linkNext failed')
+
+  const afterLink = await req(`/api/signal/state/${encodeURIComponent(code)}`)
+  assert(afterLink.status === 200, 'get state after link failed')
+  assert(afterLink.json?.nextShortcode === code2, 'nextShortcode not stored on prior session')
+
+  console.log('Shortcode signaling smoke test passed (host<->guest payload transfer + TTL state transitions + linkNext).')
 }
 
 run().catch((err) => {
