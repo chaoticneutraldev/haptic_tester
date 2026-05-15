@@ -1,10 +1,17 @@
 import { QRCodeSVG } from 'qrcode.react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { HAPTIC_PRESETS, getPresetById } from '../lib/hapticPresets'
+import { RECOMMENDED_PATTERN_DURATION_MS, RECOMMENDED_PATTERN_EVENTS } from '../lib/recommendedPattern'
 import { QR_SAFE_MAX_LEN } from '../lib/signaling'
 import { SIGNALING_COMPACT_PREFIX } from '../lib/signalingCodec'
 import { generateSessionId } from '../lib/sessionId'
-import { createSignalSession, getSignalState, postSignalAnswer, postSignalOffer } from '../lib/signalApi'
+import {
+  createSignalSession,
+  getSignalState,
+  postLinkNextShortcode,
+  postSignalAnswer,
+  postSignalOffer,
+} from '../lib/signalApi'
 import {
   hostApplyAnswer,
   hostCreateOffer,
@@ -47,6 +54,17 @@ type GuestHeartbeat = {
   sustainedLevel: number
   recentTriggers30s: number
   lockedMode: boolean
+}
+
+const GUEST_INTENSITY_CHECK_STORAGE_KEY = 'haptic-pairing-guest-intensity-check'
+
+function loadGuestIntensityCheck(): 'unknown' | 'felt' | 'weak' {
+  try {
+    const raw = localStorage.getItem(GUEST_INTENSITY_CHECK_STORAGE_KEY)
+    return raw === 'felt' || raw === 'weak' ? raw : 'unknown'
+  } catch {
+    return 'unknown'
+  }
 }
 
 function IcePathPanel({ snap, context }: { snap: PeerNetSnapshot | null; context: 'host' | 'guest' }) {
@@ -125,63 +143,6 @@ export function HapticsPairingPage() {
   }
 
   return <GuestFlow onBack={() => setRole('pick')} supported={supported} />
-}
-
-function HostSignalingProgress({
-  step,
-  busy,
-  hostHandoff,
-}: {
-  step: HostStep
-  busy: boolean
-  hostHandoff: boolean
-}) {
-  const line = useMemo(() => {
-    if (step === 'connected') {
-      return {
-        title: 'Connected',
-        detail: 'Data channel is open. You can send haptics to the guest.',
-      }
-    }
-    if (step === 'idle' && busy) {
-      return {
-        title: 'Step 1 of 4 — Working…',
-        detail: 'Creating the WebRTC offer and gathering ICE candidates (network discovery). This can take a few seconds.',
-      }
-    }
-    if (step === 'idle') {
-      return {
-        title: 'Step 1 of 4 — Start',
-        detail:
-          'Tap “Generate offer” once and wait for the blob to appear. Tapping again while it’s working can invalidate pairing.',
-      }
-    }
-    if (step === 'offer-ready' && busy) {
-      return {
-        title: 'Step 3 of 4 — Working…',
-        detail: 'Applying the guest’s answer and finishing ICE on this device.',
-      }
-    }
-    if (step === 'offer-ready' && hostHandoff) {
-      return {
-        title: 'Step 4 of 4 — Network in progress',
-        detail:
-          'Signaling is done. The data channel opens only after ICE/DTLS succeeds between devices. Check “Network path” below—if ICE fails, use the same Wi‑Fi or a hotspot and generate a new offer.',
-      }
-    }
-    return {
-      title: 'Step 2 of 4 — Share the offer',
-      detail:
-        'Share the pair code with the guest. Manual blob/QR is only needed if shortcode sync fails.',
-    }
-  }, [step, busy, hostHandoff])
-
-  return (
-    <div className="signaling-progress" role="status" aria-live="polite">
-      <p className="signaling-progress__title">{line.title}</p>
-      <p className="signaling-progress__detail">{line.detail}</p>
-    </div>
-  )
 }
 
 function GuestSignalingProgress({
@@ -283,25 +244,32 @@ function PairingHeartbeatFooter({
   )
 }
 
-function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolean }) {
-  const MATCH_TTL_MS = 15 * 60 * 1000
-  const sessionId = useMemo(() => generateSessionId(), [])
-  const [step, setStep] = useState<HostStep>('idle')
-  const [busy, setBusy] = useState(false)
-  const [hostHandoff, setHostHandoff] = useState(false)
-  const [error, setError] = useState<string | null>(null)
-  const pcRef = useRef<RTCPeerConnection | null>(null)
-  const channelRef = useRef<RTCDataChannel | null>(null)
-  /** Ignores stale async completions if “Generate offer” is clicked again while ICE is still running */
-  const hostOfferGenerationRef = useRef(0)
-  const [hostNetSnap, setHostNetSnap] = useState<PeerNetSnapshot | null>(null)
-  const [offerText, setOfferText] = useState('')
-  const [answerInput, setAnswerInput] = useState('')
-  const [pairCode, setPairCode] = useState('')
-  const [offerExpiresAt, setOfferExpiresAt] = useState<number | null>(null)
-  const [showManualHost, setShowManualHost] = useState(false)
-  const [lastGuestAck, setLastGuestAck] = useState<{ kind: HostAckKind; at: number } | null>(null)
+type HostGuest = {
+  id: string
+  label: string
+  step: HostStep
+  busy: boolean
+  hostHandoff: boolean
+  error: string | null
+  netSnap: PeerNetSnapshot | null
+  offerText: string
+  answerInput: string
+  pairCode: string
+  offerExpiresAt: number | null
+  lastGuestAck: { kind: HostAckKind; at: number } | null
+  deliveryDots: DeliveryDot[]
+  heartbeat: GuestHeartbeat | null
+  sessionStartedAt: number | null
+  /** Data channel dropped unexpectedly while paired (not user-ended). */
+  linkLost: boolean
+  /** Host published a replacement offer and linked it from the guest’s old code. */
+  hostReconnectWaiting: boolean
+}
 
+function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolean }) {
+  /** Only used if the server omits `matchExpiresAt` (e.g. older signaling rows). */
+  const MATCH_TTL_MS_FALLBACK = 2 * 60 * 60 * 1000
+  const sessionId = useMemo(() => generateSessionId(), [])
   const [mode, setMode] = useState<'instant' | 'pattern' | 'sustained'>('instant')
   const [patterns, setPatterns] = useState<HostPatternConfig[]>(HOST_PATTERN_PRESETS)
   const [activePatternId, setActivePatternId] = useState(HOST_PATTERN_PRESETS[0]?.id ?? 'pattern-a')
@@ -309,30 +277,38 @@ function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolea
   const [loopMode, setLoopMode] = useState(false)
   const [playheadMs, setPlayheadMs] = useState(0)
   const [sustainLevel, setSustainLevel] = useState(0)
-  const [deliveryDots, setDeliveryDots] = useState<DeliveryDot[]>([])
+  const [guests, setGuests] = useState<HostGuest[]>([])
+  const [countdownNow, setCountdownNow] = useState(() => Date.now())
+  const [forceCompactFooter, setForceCompactFooter] = useState(false)
   const seqRef = useRef(1)
-  const [guestHeartbeat, setGuestHeartbeat] = useState<GuestHeartbeat | null>(null)
-  const [hostSessionStartedAt, setHostSessionStartedAt] = useState<number | null>(null)
+  const playheadRaf = useRef<number | null>(null)
+  const playAnchor = useRef<{ startAt: number; startPlayhead: number } | null>(null)
+  const localTimeouts = useRef<number[]>([])
+  const pcsRef = useRef<Record<string, RTCPeerConnection>>({})
+  const channelsRef = useRef<Record<string, RTCDataChannel>>({})
+  const offerGenerationRef = useRef<Record<string, number>>({})
+  const guestCounterRef = useRef(1)
+  /** Ignore data-channel close while intentionally rotating or removing a guest PC. */
+  const hostSuppressDisconnectRef = useRef<Record<string, boolean>>({})
+
+  const connectedGuests = useMemo(() => guests.filter((g) => g.step === 'connected'), [guests])
+  const compactFooter = forceCompactFooter || connectedGuests.length >= 6
   const activePattern = useMemo(
     () => patterns.find((p) => p.id === activePatternId) ?? patterns[0] ?? HOST_PATTERN_PRESETS[0],
     [patterns, activePatternId],
   )
   const durationMs = activePattern.durationMs
   const events = activePattern.events
-  const playheadRaf = useRef<number | null>(null)
-  const playAnchor = useRef<{ startAt: number; startPlayhead: number } | null>(null)
-  const localTimeouts = useRef<number[]>([])
-  const applyAnswerButtonRef = useRef<HTMLButtonElement | null>(null)
-  const prevAnswerTrimmedRef = useRef('')
-  const [countdownNow, setCountdownNow] = useState(() => Date.now())
-  const answerReady = Boolean(answerInput.trim()) && !hostHandoff
-  const answerTimeoutRemainingS =
-    offerExpiresAt && step !== 'connected' ? Math.max(0, Math.ceil((offerExpiresAt - countdownNow) / 1000)) : null
-  const answerTimeoutExpired = typeof answerTimeoutRemainingS === 'number' && answerTimeoutRemainingS <= 0
 
-  const send = useCallback((msg: DcMessage) => {
-    const ch = channelRef.current
-    if (ch && ch.readyState === 'open') ch.send(stringifyDcMessage(msg))
+  const updateGuest = useCallback((id: string, updater: (guest: HostGuest) => HostGuest) => {
+    setGuests((prev) => prev.map((guest) => (guest.id === id ? updater(guest) : guest)))
+  }, [])
+
+  const broadcast = useCallback((msg: DcMessage) => {
+    const raw = stringifyDcMessage(msg)
+    Object.values(channelsRef.current).forEach((ch) => {
+      if (ch.readyState === 'open') ch.send(raw)
+    })
   }, [])
 
   const clearLocalSched = useCallback(() => {
@@ -340,29 +316,276 @@ function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolea
     localTimeouts.current = []
   }, [])
 
-  const endConnection = useCallback(
-    (notifyGuest: boolean) => {
-      if (notifyGuest) send({ v: 1, t: 'disconnect' })
-      clearLocalSched()
-      pcRef.current?.close()
-      channelRef.current?.close()
-      pcRef.current = null
-      channelRef.current = null
-      setStep('idle')
-      setHostHandoff(false)
-      setHostNetSnap(null)
-      setPairCode('')
-      setOfferExpiresAt(null)
-      setOfferText('')
-      setAnswerInput('')
-      setLastGuestAck(null)
-      setDeliveryDots([])
-      setSustainLevel(0)
-      setGuestHeartbeat(null)
-      setHostSessionStartedAt(null)
-      setError(null)
+  const removeGuest = useCallback(
+    (guestId: string, notifyGuest: boolean) => {
+      hostSuppressDisconnectRef.current[guestId] = true
+      const ch = channelsRef.current[guestId]
+      if (notifyGuest && ch && ch.readyState === 'open') {
+        ch.send(stringifyDcMessage({ v: 1, t: 'disconnect' }))
+      }
+      channelsRef.current[guestId]?.close()
+      pcsRef.current[guestId]?.close()
+      delete channelsRef.current[guestId]
+      delete pcsRef.current[guestId]
+      delete offerGenerationRef.current[guestId]
+      delete hostSuppressDisconnectRef.current[guestId]
+      setGuests((prev) => prev.filter((g) => g.id !== guestId))
     },
-    [send, clearLocalSched],
+    [setGuests],
+  )
+
+  const addGuest = useCallback(() => {
+    const id = crypto.randomUUID()
+    const label = `Guest ${guestCounterRef.current++}`
+    const guest: HostGuest = {
+      id,
+      label,
+      step: 'idle',
+      busy: false,
+      hostHandoff: false,
+      error: null,
+      netSnap: null,
+      offerText: '',
+      answerInput: '',
+      pairCode: '',
+      offerExpiresAt: null,
+      lastGuestAck: null,
+      deliveryDots: [],
+      heartbeat: null,
+      sessionStartedAt: null,
+      linkLost: false,
+      hostReconnectWaiting: false,
+    }
+    setGuests((prev) => [...prev, guest])
+    return id
+  }, [])
+
+  const wireHostChannel = useCallback(
+    (guestId: string, pc: RTCPeerConnection, channel: RTCDataChannel, onGuestDisconnectMessage: () => void) => {
+      const pushNet = () => {
+        updateGuest(guestId, (g) => ({
+          ...g,
+          netSnap: {
+            ice: pc.iceConnectionState,
+            connection: pc.connectionState,
+            dataChannel: channel.readyState,
+          },
+        }))
+      }
+      const markLinkLost = () => {
+        if (hostSuppressDisconnectRef.current[guestId]) return
+        updateGuest(guestId, (g) =>
+          g.step === 'connected' ? { ...g, linkLost: true, hostReconnectWaiting: false } : g,
+        )
+      }
+      channel.onmessage = (ev) => {
+        const msg = parseDcMessage(typeof ev.data === 'string' ? ev.data : '')
+        if (!msg) return
+        if (msg.t === 'disconnect') {
+          onGuestDisconnectMessage()
+          return
+        }
+        if (msg.t === 'heartbeat') {
+          updateGuest(guestId, (g) => ({
+            ...g,
+            heartbeat: {
+              sentAt: msg.sentAt,
+              sessionStartedAt: msg.sessionStartedAt,
+              sustainedLevel: msg.sustainedLevel,
+              recentTriggers30s: msg.recentTriggers30s,
+              lockedMode: msg.lockedMode,
+            },
+          }))
+          return
+        }
+        if (msg.t === 'ack') {
+          updateGuest(guestId, (g) => ({
+            ...g,
+            lastGuestAck: { kind: msg.kind, at: msg.at },
+            deliveryDots:
+              msg.kind === 'instant' && typeof msg.seq === 'number'
+                ? g.deliveryDots.map((d) => (d.seq === msg.seq ? { ...d, status: 'ack' } : d))
+                : g.deliveryDots,
+          }))
+        }
+      }
+      pc.addEventListener('iceconnectionstatechange', () => {
+        pushNet()
+        if (pc.iceConnectionState === 'failed') markLinkLost()
+      })
+      pc.addEventListener('connectionstatechange', () => {
+        pushNet()
+        if (pc.connectionState === 'failed' || pc.connectionState === 'closed') markLinkLost()
+      })
+      channel.addEventListener('open', pushNet)
+      channel.addEventListener('close', markLinkLost)
+      pushNet()
+    },
+    [updateGuest],
+  )
+
+  const finalizeHostChannelOpen = useCallback(
+    (guestId: string) => {
+      updateGuest(guestId, (g) => ({
+        ...g,
+        step: 'connected',
+        hostHandoff: false,
+        linkLost: false,
+        hostReconnectWaiting: false,
+        sessionStartedAt: Date.now(),
+      }))
+    },
+    [updateGuest],
+  )
+
+  const generateOfferForGuest = useCallback(
+    async (guestId: string) => {
+      hostSuppressDisconnectRef.current[guestId] = true
+      updateGuest(guestId, (g) => ({
+        ...g,
+        busy: true,
+        error: null,
+        hostHandoff: false,
+        answerInput: '',
+        offerExpiresAt: null,
+        netSnap: null,
+        linkLost: false,
+        hostReconnectWaiting: false,
+      }))
+      const gen = (offerGenerationRef.current[guestId] ?? 0) + 1
+      offerGenerationRef.current[guestId] = gen
+      try {
+        pcsRef.current[guestId]?.close()
+        const { pc, channel, offerText } = await hostCreateOffer()
+        if (offerGenerationRef.current[guestId] !== gen) {
+          pc.close()
+          return
+        }
+        pcsRef.current[guestId] = pc
+        channelsRef.current[guestId] = channel
+        wireHostChannel(guestId, pc, channel, () => {
+          removeGuest(guestId, false)
+        })
+        const signal = await createSignalSession()
+        const posted = await postSignalOffer(signal.code, offerText)
+        const expiresMs = posted.matchExpiresAt ? Date.parse(posted.matchExpiresAt) : Date.now() + MATCH_TTL_MS_FALLBACK
+        updateGuest(guestId, (g) => ({
+          ...g,
+          offerText,
+          pairCode: signal.code,
+          offerExpiresAt: Number.isNaN(expiresMs) ? Date.now() + MATCH_TTL_MS_FALLBACK : expiresMs,
+          step: 'offer-ready',
+          busy: false,
+          hostHandoff: false,
+          error: null,
+        }))
+        channel.onopen = () => {
+          finalizeHostChannelOpen(guestId)
+        }
+        if (channel.readyState === 'open') {
+          finalizeHostChannelOpen(guestId)
+        }
+      } catch (e) {
+        updateGuest(guestId, (g) => ({
+          ...g,
+          busy: false,
+          error: e instanceof Error ? e.message : 'Failed to create offer',
+        }))
+      } finally {
+        hostSuppressDisconnectRef.current[guestId] = false
+      }
+    },
+    [MATCH_TTL_MS_FALLBACK, finalizeHostChannelOpen, removeGuest, updateGuest, wireHostChannel],
+  )
+
+  const reconnectHostGuest = useCallback(
+    async (guestId: string) => {
+      const prevGuest = guests.find((g) => g.id === guestId)
+      const previousPairCode = prevGuest?.pairCode ?? ''
+      if (previousPairCode.length < 5) {
+        updateGuest(guestId, (g) => ({ ...g, error: 'No prior pair code stored; use Generate new offer.' }))
+        return
+      }
+      hostSuppressDisconnectRef.current[guestId] = true
+      updateGuest(guestId, (g) => ({
+        ...g,
+        busy: true,
+        error: null,
+        linkLost: false,
+        hostReconnectWaiting: true,
+        hostHandoff: false,
+        answerInput: '',
+        offerExpiresAt: null,
+        netSnap: null,
+        step: 'offer-ready',
+      }))
+      const gen = (offerGenerationRef.current[guestId] ?? 0) + 1
+      offerGenerationRef.current[guestId] = gen
+      try {
+        pcsRef.current[guestId]?.close()
+        const { pc, channel, offerText } = await hostCreateOffer()
+        if (offerGenerationRef.current[guestId] !== gen) {
+          pc.close()
+          return
+        }
+        pcsRef.current[guestId] = pc
+        channelsRef.current[guestId] = channel
+        wireHostChannel(guestId, pc, channel, () => {
+          removeGuest(guestId, false)
+        })
+        const signal = await createSignalSession()
+        const posted = await postSignalOffer(signal.code, offerText)
+        await postLinkNextShortcode(previousPairCode, signal.code)
+        const expiresMs = posted.matchExpiresAt ? Date.parse(posted.matchExpiresAt) : Date.now() + MATCH_TTL_MS_FALLBACK
+        updateGuest(guestId, (g) => ({
+          ...g,
+          offerText,
+          pairCode: signal.code,
+          offerExpiresAt: Number.isNaN(expiresMs) ? Date.now() + MATCH_TTL_MS_FALLBACK : expiresMs,
+          step: 'offer-ready',
+          busy: false,
+          hostHandoff: false,
+          error: null,
+        }))
+        channel.onopen = () => {
+          finalizeHostChannelOpen(guestId)
+        }
+        if (channel.readyState === 'open') {
+          finalizeHostChannelOpen(guestId)
+        }
+      } catch (e) {
+        updateGuest(guestId, (g) => ({
+          ...g,
+          busy: false,
+          hostReconnectWaiting: false,
+          error: e instanceof Error ? e.message : 'Reconnect failed',
+        }))
+      } finally {
+        hostSuppressDisconnectRef.current[guestId] = false
+      }
+    },
+    [MATCH_TTL_MS_FALLBACK, finalizeHostChannelOpen, guests, removeGuest, updateGuest, wireHostChannel],
+  )
+
+  const applyAnswerForGuest = useCallback(
+    async (guestId: string) => {
+      const pc = pcsRef.current[guestId]
+      const guest = guests.find((g) => g.id === guestId)
+      if (!pc || !guest || !guest.answerInput.trim()) return
+      updateGuest(guestId, (g) => ({ ...g, busy: true, error: null }))
+      try {
+        await hostApplyAnswer(pc, guest.answerInput.trim())
+        updateGuest(guestId, (g) => ({ ...g, hostHandoff: true, busy: false }))
+      } catch (e) {
+        updateGuest(guestId, (g) => ({
+          ...g,
+          hostHandoff: false,
+          busy: false,
+          error: e instanceof Error ? e.message : 'Invalid answer',
+        }))
+      }
+    },
+    [guests, updateGuest],
   )
 
   const updateActivePattern = useCallback(
@@ -377,8 +600,7 @@ function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolea
       clearLocalSched()
       const startAt = Date.now() + 180
       playAnchor.current = { startAt, startPlayhead: initial }
-      send({ v: 1, t: 'play', startAt, durationMs, events, initialPlayheadMs: initial })
-
+      broadcast({ v: 1, t: 'play', startAt, durationMs, events, initialPlayheadMs: initial })
       const now = Date.now()
       const delay0 = Math.max(0, startAt - now)
       for (const ev of events) {
@@ -390,12 +612,12 @@ function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolea
         localTimeouts.current.push(t)
       }
     },
-    [clearLocalSched, send, durationMs, events],
+    [broadcast, clearLocalSched, durationMs, events],
   )
 
   const broadcastPatternState = useCallback(
     (overrides?: Partial<{ playing: boolean; playheadMs: number }>) => {
-      send({
+      broadcast({
         v: 1,
         t: 'patternState',
         durationMs,
@@ -404,11 +626,24 @@ function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolea
         playing: overrides?.playing ?? playing,
       })
     },
-    [durationMs, events, playheadMs, playing, send],
+    [broadcast, durationMs, events, playheadMs, playing],
   )
 
   useEffect(() => {
-    if (step !== 'connected') return
+    if (connectedGuests.length === 0) return
+    const timer = window.setInterval(() => {
+      broadcast({ v: 1, t: 'hostHeartbeat', sentAt: Date.now() })
+    }, 5000)
+    return () => window.clearInterval(timer)
+  }, [broadcast, connectedGuests.length])
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setCountdownNow(Date.now()), 1000)
+    return () => window.clearInterval(timer)
+  }, [])
+
+  useEffect(() => {
+    if (connectedGuests.length === 0) return
     if (!playing) {
       if (playheadRaf.current) cancelAnimationFrame(playheadRaf.current)
       playheadRaf.current = null
@@ -429,7 +664,7 @@ function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolea
         }
         setPlaying(false)
         playAnchor.current = null
-        send({ v: 1, t: 'pause', playheadMs: durationMs })
+        broadcast({ v: 1, t: 'pause', playheadMs: durationMs })
         broadcastPatternState({ playing: false, playheadMs: durationMs })
         return
       }
@@ -439,165 +674,78 @@ function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolea
     return () => {
       if (playheadRaf.current) cancelAnimationFrame(playheadRaf.current)
     }
-  }, [playing, step, durationMs, send, broadcastPatternState, loopMode, schedulePatternCycle])
+  }, [broadcast, broadcastPatternState, connectedGuests.length, durationMs, loopMode, playing, schedulePatternCycle])
 
   useEffect(() => {
-    if (step !== 'connected') return
-    if (playing) return
+    if (connectedGuests.length === 0 || playing) return
     broadcastPatternState()
-  }, [events, durationMs, step, playing, broadcastPatternState, playheadMs])
-
-  const generateOffer = async () => {
-    setError(null)
-    setHostHandoff(false)
-    setAnswerInput('')
-    setOfferExpiresAt(null)
-    setHostNetSnap(null)
-    const gen = ++hostOfferGenerationRef.current
-    setBusy(true)
-    try {
-      pcRef.current?.close()
-      const { pc, channel, offerText: text } = await hostCreateOffer()
-      if (gen !== hostOfferGenerationRef.current) {
-        pc.close()
-        return
-      }
-      pcRef.current = pc
-      channelRef.current = channel
-      channel.onmessage = (ev) => {
-        const msg = parseDcMessage(typeof ev.data === 'string' ? ev.data : '')
-        if (msg?.t === 'disconnect') {
-          endConnection(false)
-          setError('Guest ended the connection.')
-          return
-        }
-        if (msg?.t === 'heartbeat') {
-          setGuestHeartbeat({
-            sentAt: msg.sentAt,
-            sessionStartedAt: msg.sessionStartedAt,
-            sustainedLevel: msg.sustainedLevel,
-            recentTriggers30s: msg.recentTriggers30s,
-            lockedMode: msg.lockedMode,
-          })
-          return
-        }
-        if (msg?.t === 'ack') {
-          setLastGuestAck({ kind: msg.kind, at: msg.at })
-          if (msg.kind === 'instant' && typeof msg.seq === 'number') {
-            setDeliveryDots((prev) => prev.map((d) => (d.seq === msg.seq ? { ...d, status: 'ack' } : d)))
-          }
-        }
-      }
-      const pushHostNet = () => {
-        setHostNetSnap({
-          ice: pc.iceConnectionState,
-          connection: pc.connectionState,
-          dataChannel: channel.readyState,
-        })
-      }
-      pc.addEventListener('iceconnectionstatechange', pushHostNet)
-      pc.addEventListener('connectionstatechange', pushHostNet)
-      channel.addEventListener('open', pushHostNet)
-      pushHostNet()
-      setOfferText(text)
-      const signal = await createSignalSession()
-      setPairCode(signal.code)
-      await postSignalOffer(signal.code, text)
-      setOfferExpiresAt(Date.now() + MATCH_TTL_MS)
-      setStep('offer-ready')
-      channel.onopen = () => {
-        pushHostNet()
-        setHostSessionStartedAt(Date.now())
-        setHostHandoff(false)
-        setStep('connected')
-      }
-      if (channel.readyState === 'open') {
-        setHostSessionStartedAt(Date.now())
-        setHostHandoff(false)
-        setStep('connected')
-      }
-    } catch (e) {
-      if (gen === hostOfferGenerationRef.current) {
-        setError(e instanceof Error ? e.message : 'Failed to create offer')
-      }
-    } finally {
-      if (gen === hostOfferGenerationRef.current) {
-        setBusy(false)
-      }
-    }
-  }
-
-  const applyAnswer = async () => {
-    const pc = pcRef.current
-    if (!pc) return
-    setError(null)
-    setBusy(true)
-    try {
-      await hostApplyAnswer(pc, answerInput.trim())
-      setHostHandoff(true)
-    } catch (e) {
-      setHostHandoff(false)
-      setError(e instanceof Error ? e.message : 'Invalid answer')
-    } finally {
-      setBusy(false)
-    }
-  }
+  }, [broadcastPatternState, connectedGuests.length, durationMs, events, playing, playheadMs])
 
   useEffect(() => {
-    if (!pairCode || step === 'connected') return
+    const waiting = guests.filter((g) => g.pairCode && g.step !== 'connected')
+    if (waiting.length === 0) return
     const timer = window.setInterval(async () => {
-      try {
-        const s = await getSignalState(pairCode)
-        if (s.answer && !answerInput) {
-          setAnswerInput(s.answer)
-        }
-      } catch {
-        /* best-effort polling */
-      }
+      await Promise.all(
+        waiting.map(async (guest) => {
+          try {
+            const s = await getSignalState(guest.pairCode)
+            if (s.matchExpiresAt) {
+              const ms = Date.parse(s.matchExpiresAt)
+              if (!Number.isNaN(ms)) {
+                updateGuest(guest.id, (g) => ({ ...g, offerExpiresAt: ms }))
+              }
+            }
+            if (s.answer) {
+              updateGuest(guest.id, (g) => (g.answerInput ? g : { ...g, answerInput: s.answer ?? '' }))
+            }
+          } catch {
+            /* best-effort polling */
+          }
+        }),
+      )
     }, 2000)
     return () => window.clearInterval(timer)
-  }, [pairCode, step, answerInput])
+  }, [guests, updateGuest])
 
   useEffect(() => {
-    if (!offerExpiresAt || step === 'connected') return
-    const t = window.setInterval(() => setCountdownNow(Date.now()), 1000)
-    return () => window.clearInterval(t)
-  }, [offerExpiresAt, step])
-
-  useEffect(() => {
-    const trimmed = answerInput.trim()
-    if (trimmed && !prevAnswerTrimmedRef.current && !hostHandoff) {
-      window.setTimeout(() => {
-        applyAnswerButtonRef.current?.focus()
-        applyAnswerButtonRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' })
-      }, 50)
+    return () => {
+      clearLocalSched()
+      Object.values(channelsRef.current).forEach((ch) => ch.close())
+      Object.values(pcsRef.current).forEach((pc) => pc.close())
+      channelsRef.current = {}
+      pcsRef.current = {}
     }
-    prevAnswerTrimmedRef.current = trimmed
-  }, [answerInput, hostHandoff])
-
-  useEffect(() => {
-    if (step !== 'connected') return
-    const timer = window.setInterval(() => {
-      send({ v: 1, t: 'hostHeartbeat', sentAt: Date.now() })
-    }, 5000)
-    return () => window.clearInterval(timer)
-  }, [step, send])
+  }, [clearLocalSched])
 
   const playInstant = (presetId: string) => {
     const p = getPresetById(presetId)
     if (p) vibratePattern(p.pattern)
     const seq = seqRef.current++
-    setDeliveryDots((prev) => [...prev, { seq, presetId, status: 'sent' as const }].slice(-20))
+    setGuests((prev) =>
+      prev.map((guest) =>
+        guest.step !== 'connected'
+          ? guest
+          : {
+              ...guest,
+              deliveryDots: [...guest.deliveryDots, { seq, presetId, status: 'sent' as const }].slice(-20),
+            },
+      ),
+    )
     window.setTimeout(() => {
-      setDeliveryDots((prev) => prev.map((d) => (d.seq === seq && d.status === 'sent' ? { ...d, status: 'timeout' } : d)))
+      setGuests((prev) =>
+        prev.map((guest) => ({
+          ...guest,
+          deliveryDots: guest.deliveryDots.map((d) => (d.seq === seq && d.status === 'sent' ? { ...d, status: 'timeout' } : d)),
+        })),
+      )
     }, 4000)
-    send({ v: 1, t: 'instant', presetId, seq })
+    broadcast({ v: 1, t: 'instant', presetId, seq })
   }
 
   const sendSustainLevel = (nextLevel: number) => {
     const clamped = Math.max(0, Math.min(100, Math.round(nextLevel)))
     setSustainLevel(clamped)
-    send({ v: 1, t: 'sustain', level: clamped })
+    broadcast({ v: 1, t: 'sustain', level: clamped })
   }
 
   const sendStopAll = () => {
@@ -606,7 +754,7 @@ function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolea
     setPlaying(false)
     setPlayheadMs(0)
     setSustainLevel(0)
-    send({ v: 1, t: 'stopAll' })
+    broadcast({ v: 1, t: 'stopAll' })
   }
 
   const startPatternPlayback = () => {
@@ -618,7 +766,7 @@ function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolea
     clearLocalSched()
     playAnchor.current = null
     setPlaying(false)
-    send({ v: 1, t: 'pause', playheadMs })
+    broadcast({ v: 1, t: 'pause', playheadMs })
     broadcastPatternState({ playing: false, playheadMs })
   }
 
@@ -637,6 +785,19 @@ function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolea
     }))
   }
 
+  const loadRecommendedPattern = useCallback(() => {
+    updateActivePattern((p) => ({
+      ...p,
+      durationMs: RECOMMENDED_PATTERN_DURATION_MS,
+      events: RECOMMENDED_PATTERN_EVENTS.map((ev) => ({
+        id: crypto.randomUUID(),
+        offsetMs: ev.offsetMs,
+        presetId: ev.presetId,
+      })),
+    }))
+    setPlayheadMs(0)
+  }, [updateActivePattern])
+
   const removeEvent = (id: string) => {
     updateActivePattern((p) => ({
       ...p,
@@ -649,8 +810,7 @@ function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolea
     const rect = (e.currentTarget as HTMLDivElement).getBoundingClientRect()
     const x = e.clientX - rect.left
     const ratio = Math.min(1, Math.max(0, x / rect.width))
-    const ms = quantize(ratio * durationMs)
-    setPlayheadMs(ms)
+    setPlayheadMs(quantize(ratio * durationMs))
   }
 
   return (
@@ -662,135 +822,185 @@ function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolea
         </button>
       </div>
       <p className="session-code">
-        Session code: <strong>{sessionId}</strong> (read this aloud to the guest for verification)
+        Session code: <strong>{sessionId}</strong> (read this aloud to each guest for verification)
       </p>
-      {pairCode && (
-        <p className="session-code">
-          Pair code: <strong>{pairCode}</strong> (share this 5-character code; match TTL 15m, active TTL 12h)
-        </p>
-      )}
 
-      <HostSignalingProgress step={step} busy={busy} hostHandoff={hostHandoff} />
-
-      {step !== 'connected' && hostNetSnap && <IcePathPanel snap={hostNetSnap} context="host" />}
-
-      {step !== 'connected' && (
-        <section className="panel stack">
-          <h2>Pairing</h2>
-          <ol className="steps">
-            <li>
-              <p>Generate an offer and share the pair code with the guest (shortcode mode).</p>
-              {step === 'idle' && (
-                <button type="button" className="btn btn-primary" disabled={busy} onClick={generateOffer}>
-                  Generate offer
-                </button>
+      <section className="panel stack">
+        <div className="row spread">
+          <h2>Guest sessions</h2>
+          <button
+            type="button"
+            className="btn btn-primary"
+            onClick={() => {
+              const id = addGuest()
+              void generateOfferForGuest(id)
+            }}
+          >
+            {connectedGuests.length > 0 ? 'Add another guest' : 'Add first guest'}
+          </button>
+        </div>
+        {guests.length === 0 && <p className="muted">Start by adding a guest. A unique pair code is generated per guest session.</p>}
+        {guests.map((guest) => {
+          const answerReady = Boolean(guest.answerInput.trim()) && !guest.hostHandoff
+          const answerTimeoutRemainingS =
+            guest.offerExpiresAt && guest.step !== 'connected'
+              ? Math.max(0, Math.ceil((guest.offerExpiresAt - countdownNow) / 1000))
+              : null
+          const answerTimeoutExpired = typeof answerTimeoutRemainingS === 'number' && answerTimeoutRemainingS <= 0
+          return (
+            <section key={guest.id} className="panel stack">
+              <div className="row spread">
+                <h3>{guest.label}</h3>
+                <div className="row wrap">
+                  {guest.linkLost && (
+                    <>
+                      <button
+                        type="button"
+                        className="btn btn-primary"
+                        disabled={guest.busy}
+                        onClick={() => void reconnectHostGuest(guest.id)}
+                      >
+                        Reconnect session
+                      </button>
+                      <button type="button" className="btn btn-ghost" onClick={() => removeGuest(guest.id, false)}>
+                        Remove guest
+                      </button>
+                    </>
+                  )}
+                  {guest.step === 'connected' && !guest.linkLost && (
+                    <button type="button" className="btn btn-danger" onClick={() => removeGuest(guest.id, true)}>
+                      End connection
+                    </button>
+                  )}
+                  {guest.step !== 'connected' && (
+                    <button type="button" className="btn" disabled={guest.busy} onClick={() => void generateOfferForGuest(guest.id)}>
+                      Generate new offer
+                    </button>
+                  )}
+                  {guest.step !== 'connected' && (
+                    <button type="button" className="btn btn-ghost" onClick={() => removeGuest(guest.id, false)}>
+                      Remove
+                    </button>
+                  )}
+                </div>
+              </div>
+              {guest.linkLost && (
+                <p className="warn">
+                  Data channel or transport dropped unexpectedly. Tap <strong>Reconnect session</strong> to publish a new
+                  pair code linked from the guest’s previous code, or remove this guest and add a new one.
+                </p>
               )}
-            </li>
-            <li>
-              <p>Wait for guest answer via shortcode (auto-fill), then connect.</p>
-              <button type="button" className="btn" onClick={() => setShowManualHost((v) => !v)}>
-                {showManualHost ? 'Hide manual blob/QR fallback' : 'Show manual blob/QR fallback'}
-              </button>
-              {showManualHost && offerText && (
+              {guest.hostReconnectWaiting && guest.step !== 'connected' && (
+                <p className="muted">
+                  Reconnect offer published on the server. New pair code: <strong>{guest.pairCode}</strong>. Ask the guest
+                  to use <strong>Reconnect</strong> on their device (they should poll their <em>old</em> code first), then
+                  apply the new answer when it arrives.
+                </p>
+              )}
+              {guest.pairCode && (
+                <p className="session-code">
+                  Pair code: <strong>{guest.pairCode}</strong> (share this 5-character code)
+                </p>
+              )}
+              {guest.netSnap && guest.step !== 'connected' && <IcePathPanel snap={guest.netSnap} context="host" />}
+              {guest.offerText && guest.step !== 'connected' && (
                 <>
                   <p>
-                    Offer ({offerText.startsWith(SIGNALING_COMPACT_PREFIX) ? 'compact' : 'JSON'}) — {offerText.length}{' '}
-                    chars
+                    Offer ({guest.offerText.startsWith(SIGNALING_COMPACT_PREFIX) ? 'compact' : 'JSON'}) — {guest.offerText.length} chars
                   </p>
                   <div className="row wrap">
                     <button
                       type="button"
                       className="btn"
-                      onClick={() => navigator.clipboard.writeText(offerText).catch(() => {})}
+                      onClick={() => navigator.clipboard.writeText(guest.offerText).catch(() => {})}
                     >
                       Copy offer
                     </button>
-                    {offerText.length <= QR_SAFE_MAX_LEN ? (
+                    {guest.offerText.length <= QR_SAFE_MAX_LEN ? (
                       <div className="qr-box">
-                        <QRCodeSVG value={offerText} size={160} level="L" />
+                        <QRCodeSVG value={guest.offerText} size={160} level="L" />
                       </div>
                     ) : (
-                      <p className="muted">Offer too large for QR ({offerText.length} chars). Use copy instead.</p>
+                      <p className="muted">Offer too large for QR ({guest.offerText.length} chars). Use copy instead.</p>
                     )}
                   </div>
-                  <textarea className="input mono" readOnly rows={4} value={offerText} spellCheck={false} />
                 </>
               )}
-              {showManualHost && (
-                <p className="muted">Manual mode: paste guest answer blob below if shortcode sync is unavailable.</p>
-              )}
-              {showManualHost ? (
-                <textarea
-                  className="input mono"
-                  rows={6}
-                  value={answerInput}
-                  onChange={(e) => setAnswerInput(e.target.value)}
-                  spellCheck={false}
-                  placeholder={`${SIGNALING_COMPACT_PREFIX}... or paste JSON`}
-                />
-              ) : (
-                <p className="muted">
-                  {answerInput
-                    ? 'Answer received from shortcode service and ready to apply.'
-                    : 'Waiting for guest answer via shortcode...'}
-                </p>
-              )}
-              {answerReady && (
-                <p className="apply-answer-ready" role="status" aria-live="polite">
-                  Answer ready. Tap <strong>Apply answer</strong> now.
-                  {typeof answerTimeoutRemainingS === 'number' && (
-                    <>
-                      {' '}
-                      Expires in <strong>{answerTimeoutRemainingS}s</strong>.
-                    </>
+              {guest.step !== 'connected' && (
+                <>
+                  <textarea
+                    className="input mono"
+                    rows={5}
+                    value={guest.answerInput}
+                    onChange={(e) => updateGuest(guest.id, (g) => ({ ...g, answerInput: e.target.value }))}
+                    spellCheck={false}
+                    placeholder={`${SIGNALING_COMPACT_PREFIX}... or paste JSON`}
+                  />
+                  {answerReady && (
+                    <p className="apply-answer-ready" role="status" aria-live="polite">
+                      Answer ready. Tap <strong>Apply answer</strong>.
+                      {typeof answerTimeoutRemainingS === 'number' && (
+                        <>
+                          {' '}
+                          Expires in <strong>{answerTimeoutRemainingS}s</strong>.
+                        </>
+                      )}
+                    </p>
                   )}
-                </p>
+                  {answerTimeoutExpired && <p className="warn">Pair-code match window expired. Generate a new offer.</p>}
+                  <button
+                    type="button"
+                    className={`btn btn-primary ${answerReady ? 'btn-ready-apply' : ''}`}
+                    disabled={guest.busy || !guest.answerInput.trim() || guest.hostHandoff || answerTimeoutExpired}
+                    onClick={() => void applyAnswerForGuest(guest.id)}
+                  >
+                    Apply answer
+                  </button>
+                  {guest.hostHandoff && <p className="muted">Answer applied; waiting for this guest data channel to open.</p>}
+                </>
               )}
-              {answerTimeoutExpired && (
-                <p className="warn">
-                  Pair-code match window expired. Generate a new offer to continue pairing.
-                </p>
+              {guest.step === 'connected' && (
+                <>
+                  <p className="ok">Connected.</p>
+                  <p className="muted">
+                    Last ack:{' '}
+                    {guest.lastGuestAck
+                      ? `${guest.lastGuestAck.kind} @ ${new Date(guest.lastGuestAck.at).toLocaleTimeString()}`
+                      : 'none yet'}
+                  </p>
+                  <div className="delivery-dots" aria-label={`Last 20 host sends for ${guest.label}`}>
+                    {Array.from({ length: 20 }).map((_, idx) => {
+                      const dot = guest.deliveryDots[idx]
+                      const cls = dot ? `delivery-dot delivery-dot--${dot.status}` : 'delivery-dot delivery-dot--idle'
+                      return <span key={idx} className={cls} title={dot ? `${dot.presetId} #${dot.seq} ${dot.status}` : 'idle'} />
+                    })}
+                  </div>
+                </>
               )}
-              <button
-                ref={applyAnswerButtonRef}
-                type="button"
-                className={`btn btn-primary ${answerReady ? 'btn-ready-apply' : ''}`}
-                disabled={busy || !answerInput.trim() || hostHandoff || answerTimeoutExpired}
-                onClick={applyAnswer}
-              >
-                Apply answer
-              </button>
-              {hostHandoff && (
-                <p className="muted">Answer applied—waiting for the data channel. If it fails, use “Generate offer” to start over.</p>
-              )}
-            </li>
-          </ol>
-          {error && <p className="warn">{error}</p>}
-        </section>
-      )}
+              {guest.error && <p className="warn">{guest.error}</p>}
+            </section>
+          )
+        })}
+      </section>
 
-      {step === 'connected' && (
+      {connectedGuests.length > 0 && (
         <>
-          <p className="ok">Data channel open. Use the panel below; the guest device will mirror pattern view.</p>
-          <div className="row wrap">
-            <button type="button" className="btn btn-danger" onClick={() => endConnection(true)}>
-              End connection
-            </button>
-          </div>
-          <p className="muted">
-            Guest delivery ack:{' '}
-            {lastGuestAck
-              ? `${lastGuestAck.kind} @ ${new Date(lastGuestAck.at).toLocaleTimeString()}`
-              : 'none yet (send a test action)'}
+          <p className="ok">
+            Broadcasting to <strong>{connectedGuests.length}</strong> connected guest{connectedGuests.length === 1 ? '' : 's'}.
           </p>
-          <div className="delivery-dots" aria-label="Last 20 host haptic sends">
-            {Array.from({ length: 20 }).map((_, idx) => {
-              const dot = deliveryDots[idx]
-              const cls = dot ? `delivery-dot delivery-dot--${dot.status}` : 'delivery-dot delivery-dot--idle'
-              return <span key={idx} className={cls} title={dot ? `${dot.presetId} #${dot.seq} ${dot.status}` : 'idle'} />
-            })}
+          <div className="panel row wrap">
+            <label className="field inline">
+              <span>Compact guest footer</span>
+              <input type="checkbox" checked={forceCompactFooter} onChange={(e) => setForceCompactFooter(e.target.checked)} />
+            </label>
+            <p className="muted">
+              {forceCompactFooter
+                ? 'Compact mode forced on.'
+                : connectedGuests.length >= 6
+                  ? 'Compact mode auto-enabled (6+ guests).'
+                  : 'Auto mode: cards below 6 guests, compact at 6+.'}
+            </p>
           </div>
-
           <div className="panel row wrap">
             <label className="toggle">
               <span>Mode</span>
@@ -804,8 +1014,8 @@ function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolea
 
           {mode === 'instant' && (
             <section className="panel stack">
-              <h2>Haptic actions</h2>
-              {!supported && <p className="muted">This device cannot vibrate, but commands still send to the guest.</p>}
+              <h2>Haptic actions (broadcast)</h2>
+              {!supported && <p className="muted">This device cannot vibrate, but commands still broadcast to guests.</p>}
               <div className="preset-grid">
                 {HAPTIC_PRESETS.map((p) => (
                   <button key={p.id} type="button" className="preset-cell" onClick={() => playInstant(p.id)}>
@@ -818,11 +1028,8 @@ function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolea
 
           {mode === 'pattern' && (
             <section className="panel stack">
-              <h2>Pattern timeline</h2>
-              <p className="muted">
-                Switch between saved pattern slots below. Each pattern keeps its own timeline and duration. Loop mode is
-                global and applies to whichever pattern is active.
-              </p>
+              <h2>Pattern timeline (broadcast)</h2>
+              <p className="muted">All connected guests receive the same timeline and transport commands.</p>
               <div className="row wrap">
                 {patterns.map((p) => (
                   <button
@@ -847,9 +1054,10 @@ function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolea
                 <button type="button" className="btn" onClick={() => adjustDuration(1000)} disabled={durationMs >= 16000}>
                   +1s
                 </button>
-                <span className="pill">
-                  Length {(durationMs / 1000).toFixed(0)}s (1–16s)
-                </span>
+                <button type="button" className="btn" onClick={loadRecommendedPattern} disabled={playing}>
+                  Load recommended pattern
+                </button>
+                <span className="pill">Length {(durationMs / 1000).toFixed(0)}s (1–16s)</span>
                 <label className="field inline">
                   <span>Loop mode</span>
                   <input type="checkbox" checked={loopMode} onChange={(e) => setLoopMode(e.target.checked)} />
@@ -864,7 +1072,6 @@ function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolea
                   </button>
                 )}
               </div>
-
               <div
                 className="timeline"
                 onClick={onTimelineClick}
@@ -896,7 +1103,6 @@ function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolea
                   <div className="timeline-playhead" style={{ left: `${(playheadMs / durationMs) * 100}%` }} />
                 </div>
               </div>
-
               <div className="row wrap">
                 <label className="field inline">
                   <span>Add at playhead</span>
@@ -918,7 +1124,6 @@ function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolea
                   </select>
                 </label>
               </div>
-
               <ul className="event-list">
                 {events.map((ev) => {
                   const p = getPresetById(ev.presetId)
@@ -936,10 +1141,11 @@ function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolea
               </ul>
             </section>
           )}
+
           {mode === 'sustained' && (
             <section className="panel stack">
-              <h2>Sustained buzz</h2>
-              <p className="muted">Set a continuous buzz level on GUEST (0 = off, 100 = strongest emulation).</p>
+              <h2>Sustained buzz (broadcast)</h2>
+              <p className="muted">Set a continuous buzz level on all connected guests (0 = off, 100 = strongest emulation).</p>
               <div className="row wrap">
                 <button type="button" className="btn" onClick={() => sendSustainLevel(sustainLevel - 10)}>
                   -10
@@ -970,17 +1176,65 @@ function HostFlow({ onBack, supported }: { onBack: () => void; supported: boolea
               </div>
             </section>
           )}
-          <PairingHeartbeatFooter
-            role="host"
-            heartbeat={guestHeartbeat}
-            sessionStartedAt={hostSessionStartedAt}
-            onStopAll={sendStopAll}
-          />
+
+          <div className={`pairing-footer host-footer-grid ${compactFooter ? 'host-footer-grid--compact' : ''}`}>
+            {!compactFooter &&
+              connectedGuests.map((guest) => (
+                <div key={guest.id} className="host-heartbeat-card">
+                  <p>
+                    <strong>{guest.label}</strong>
+                  </p>
+                  <p>Sustain: {guest.heartbeat?.sustainedLevel ?? 0}</p>
+                  <p>30s triggers: {guest.heartbeat?.recentTriggers30s ?? 0}</p>
+                  <p>Last beat: {guest.heartbeat ? `${Math.max(0, Math.floor((countdownNow - guest.heartbeat.sentAt) / 1000))}s ago` : 'n/a'}</p>
+                  <p>Locked: {guest.heartbeat?.lockedMode ? 'ON' : 'OFF'}</p>
+                </div>
+              ))}
+            {compactFooter && (
+              <div className="host-heartbeat-table-wrap" role="region" aria-label="Connected guest heartbeat table">
+                <table className="host-heartbeat-table">
+                  <thead>
+                    <tr>
+                      <th>Guest</th>
+                      <th>Sustain</th>
+                      <th>30s</th>
+                      <th>Last beat</th>
+                      <th>Locked</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {connectedGuests.map((guest) => (
+                      <tr key={guest.id}>
+                        <td>{guest.label}</td>
+                        <td>{guest.heartbeat?.sustainedLevel ?? 0}</td>
+                        <td>{guest.heartbeat?.recentTriggers30s ?? 0}</td>
+                        <td>{guest.heartbeat ? `${Math.max(0, Math.floor((countdownNow - guest.heartbeat.sentAt) / 1000))}s` : 'n/a'}</td>
+                        <td>{guest.heartbeat?.lockedMode ? 'ON' : 'OFF'}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+            <div className="host-heartbeat-card host-heartbeat-card--actions">
+              <p>
+                <strong>Broadcast controls</strong>
+              </p>
+              <p>Connected guests: {connectedGuests.length}</p>
+              {compactFooter && <p className="muted">Compact footer mode enabled (6+ guests).</p>}
+              <button type="button" className="btn btn-danger" onClick={sendStopAll}>
+                Stop all
+              </button>
+            </div>
+          </div>
         </>
       )}
     </div>
   )
 }
+
+const GUEST_LINK_WATCHDOG_MS = 60_000
+const RECONNECT_HANDOFF_COOLDOWN_SEC = 10
 
 function GuestFlow({ onBack, supported }: { onBack: () => void; supported: boolean }) {
   const bestEffort = bestEffortHapticsMode()
@@ -1025,6 +1279,21 @@ function GuestFlow({ onBack, supported }: { onBack: () => void; supported: boole
   const playAnchor = useRef<{ startAt: number; startPlayhead: number } | null>(null)
   const hasPairCode = sessionInput.trim().length >= 5
   const [guestLocked, setGuestLocked] = useState(false)
+  const [intensityCheck, setIntensityCheck] = useState<'unknown' | 'felt' | 'weak'>(loadGuestIntensityCheck)
+  const [showReconnectPanel, setShowReconnectPanel] = useState(false)
+  const [reconnectCooldownSec, setReconnectCooldownSec] = useState(0)
+  const [emergencyStopOpen, setEmergencyStopOpen] = useState(false)
+  const [savedPairCodeLabel, setSavedPairCodeLabel] = useState<string | null>(null)
+
+  const guestUserEndedSessionRef = useRef(false)
+  const lastShortPairingCodeRef = useRef<string | null>(null)
+  const transportDeadRef = useRef(false)
+
+  useEffect(() => {
+    if (reconnectCooldownSec <= 0) return
+    const t = window.setInterval(() => setReconnectCooldownSec((c) => Math.max(0, c - 1)), 1000)
+    return () => window.clearInterval(t)
+  }, [reconnectCooldownSec])
 
   const clearGuestSched = () => {
     guestTimeouts.current.forEach((id) => window.clearTimeout(id))
@@ -1043,7 +1312,8 @@ function GuestFlow({ onBack, supported }: { onBack: () => void; supported: boole
     stopVibrate()
   }, [])
 
-  const endGuestConnection = useCallback((notifyHost: boolean) => {
+  const endGuestConnection = useCallback((notifyHost: boolean, intentionalGuestEnd = false) => {
+    if (intentionalGuestEnd) guestUserEndedSessionRef.current = true
     if (notifyHost) {
       const ch = channelRef.current
       if (ch && ch.readyState === 'open') {
@@ -1075,6 +1345,8 @@ function GuestFlow({ onBack, supported }: { onBack: () => void; supported: boole
     setGuestSafetyStopped(false)
     guestSessionStartedAtRef.current = null
     guestTriggerTimesRef.current = []
+    setShowReconnectPanel(false)
+    setEmergencyStopOpen(false)
   }, [])
 
   useEffect(() => {
@@ -1199,8 +1471,9 @@ function GuestFlow({ onBack, supported }: { onBack: () => void; supported: boole
       }
       if (msg.t === 'disconnect') {
         lastHostActivityAtRef.current = Date.now()
-        endGuestConnection(false)
-        setError('Host ended the connection.')
+        endGuestConnection(false, false)
+        setShowReconnectPanel(true)
+        setError('Host ended the connection. You can reconnect if they start a new session.')
       }
     },
     [canTriggerLocal, endGuestConnection, stopAllGuestActions, supported],
@@ -1272,14 +1545,14 @@ function GuestFlow({ onBack, supported }: { onBack: () => void; supported: boole
 
   useEffect(() => {
     if (!connected) return
-    const WATCHDOG_MS = 12_000
     const timer = window.setInterval(() => {
       const last = lastHostActivityAtRef.current
       if (!last) return
-      if (Date.now() - last > WATCHDOG_MS && !guestSafetyStopped) {
+      if (Date.now() - last > GUEST_LINK_WATCHDOG_MS && !guestSafetyStopped) {
         stopAllGuestActions()
         setGuestSafetyStopped(true)
         setError('Safety stop: host connection lost; haptics halted.')
+        setShowReconnectPanel(true)
       }
     }, 1000)
     return () => window.clearInterval(timer)
@@ -1293,78 +1566,153 @@ function GuestFlow({ onBack, supported }: { onBack: () => void; supported: boole
     guestLockedRef.current = guestLocked
   }, [guestLocked])
 
-  const createAnswer = async () => {
-    setError(null)
-    setGuestNetSnap(null)
-    setBusy(true)
-    try {
-      let resolvedOffer = offerIn.trim()
-      const enteredCode = sessionInput.trim().toUpperCase()
-      if (!resolvedOffer && enteredCode.length >= 5) {
-        const s = await getSignalState(enteredCode)
-        if (!s.offer) throw new Error('Host offer is not ready for this code yet')
-        resolvedOffer = s.offer
-        setOfferIn(resolvedOffer)
-      }
-      if (!resolvedOffer) throw new Error('Paste an offer or enter a valid pair code')
-      pcRef.current?.close()
-      const { pc, answerText: ans, waitForChannel } = await guestHandleOffer(resolvedOffer)
-      pcRef.current = pc
-      setAnswerText(ans)
-      if (enteredCode.length >= 5) {
-        await postSignalAnswer(enteredCode, ans)
-      }
-
-      const pushGuestNet = () => {
-        const snap = {
-          ice: pc.iceConnectionState,
-          connection: pc.connectionState,
-          dataChannel: channelRef.current?.readyState,
-        } as const
-        setGuestNetSnap(snap)
-        if (snap.connection === 'failed' || snap.connection === 'disconnected' || snap.connection === 'closed') {
-          stopAllGuestActions()
+  const joinHostSession = useCallback(
+    async (pairCodeOverride?: string) => {
+      transportDeadRef.current = false
+      setError(null)
+      setGuestNetSnap(null)
+      setBusy(true)
+      try {
+        let resolvedOffer = offerIn.trim()
+        const enteredCode = (pairCodeOverride ?? sessionInput).trim().toUpperCase()
+        if (pairCodeOverride) setSessionInput(enteredCode)
+        if (!resolvedOffer && enteredCode.length >= 5) {
+          const s = await getSignalState(enteredCode)
+          if (!s.offer) throw new Error('Host offer is not ready for this code yet')
+          resolvedOffer = s.offer ?? ''
+          setOfferIn(resolvedOffer)
         }
-      }
-      pc.addEventListener('iceconnectionstatechange', pushGuestNet)
-      pc.addEventListener('connectionstatechange', pushGuestNet)
-      pushGuestNet()
+        if (!resolvedOffer) throw new Error('Paste an offer or enter a valid pair code')
+        pcRef.current?.close()
+        const { pc, answerText: ans, waitForChannel } = await guestHandleOffer(resolvedOffer)
+        pcRef.current = pc
+        setAnswerText(ans)
+        if (enteredCode.length >= 5) {
+          await postSignalAnswer(enteredCode, ans)
+          lastShortPairingCodeRef.current = enteredCode
+          setSavedPairCodeLabel(enteredCode)
+        }
 
-      const ch = await waitForChannel()
-      channelRef.current = ch
-      ch.addEventListener('open', () => {
+        const onUnexpectedTransportEnd = () => {
+          if (guestUserEndedSessionRef.current) {
+            guestUserEndedSessionRef.current = false
+            transportDeadRef.current = false
+            return
+          }
+          if (transportDeadRef.current) return
+          transportDeadRef.current = true
+          stopAllGuestActions()
+          try {
+            pc.close()
+          } catch {
+            /* ignore */
+          }
+          channelRef.current = null
+          pcRef.current = null
+          setConnected(false)
+          setGuestNetSnap(null)
+          setShowReconnectPanel(true)
+          setError('Connection lost. Use Reconnect below when the host is ready.')
+        }
+
+        const pushGuestNet = () => {
+          const snap = {
+            ice: pc.iceConnectionState,
+            connection: pc.connectionState,
+            dataChannel: channelRef.current?.readyState,
+          } as const
+          setGuestNetSnap(snap)
+          if (snap.connection === 'failed' || snap.connection === 'closed') {
+            stopAllGuestActions()
+            onUnexpectedTransportEnd()
+          }
+          if (snap.connection === 'disconnected') {
+            stopAllGuestActions()
+          }
+        }
+        pc.addEventListener('iceconnectionstatechange', pushGuestNet)
+        pc.addEventListener('connectionstatechange', pushGuestNet)
         pushGuestNet()
-        lastHostActivityAtRef.current = Date.now()
-        setGuestSafetyStopped(false)
-        setConnected(true)
-      })
-      ch.addEventListener('closing', () => {
-        stopAllGuestActions()
-      })
-      ch.addEventListener('close', () => {
-        stopAllGuestActions()
-      })
-      ch.addEventListener('closing', pushGuestNet)
-      pushGuestNet()
-      ch.onmessage = (ev) => handleDcMessage(typeof ev.data === 'string' ? ev.data : '')
-      if (ch.readyState === 'open') {
+
+        const ch = await waitForChannel()
+        channelRef.current = ch
+        ch.addEventListener('open', () => {
+          pushGuestNet()
+          lastHostActivityAtRef.current = Date.now()
+          setGuestSafetyStopped(false)
+          setConnected(true)
+          setShowReconnectPanel(false)
+        })
+        ch.addEventListener('close', onUnexpectedTransportEnd)
+        ch.addEventListener('closing', pushGuestNet)
         pushGuestNet()
-        lastHostActivityAtRef.current = Date.now()
-        setGuestSafetyStopped(false)
-        setConnected(true)
+        ch.onmessage = (ev) => handleDcMessage(typeof ev.data === 'string' ? ev.data : '')
+        if (ch.readyState === 'open') {
+          pushGuestNet()
+          lastHostActivityAtRef.current = Date.now()
+          setGuestSafetyStopped(false)
+          setConnected(true)
+          setShowReconnectPanel(false)
+        }
+      } catch (e) {
+        setError(e instanceof Error ? e.message : 'Failed to handle offer')
+      } finally {
+        setBusy(false)
       }
-    } catch (e) {
-      setError(e instanceof Error ? e.message : 'Failed to handle offer')
-    } finally {
-      setBusy(false)
+    },
+    [handleDcMessage, offerIn, sessionInput, stopAllGuestActions],
+  )
+
+  const createAnswer = () => void joinHostSession()
+
+  const checkReconnectHandoff = useCallback(async () => {
+    const code = lastShortPairingCodeRef.current ?? sessionInput.trim().toUpperCase()
+    if (code.length < 5) {
+      setError('Enter your previous host pair code above, or wait for the host to share a new code.')
+      setReconnectCooldownSec(RECONNECT_HANDOFF_COOLDOWN_SEC)
+      return
     }
-  }
+    try {
+      const s = await getSignalState(code)
+      if (s.nextShortcode) {
+        setOfferIn('')
+        setAnswerText('')
+        setReconnectCooldownSec(0)
+        await joinHostSession(s.nextShortcode)
+        return
+      }
+      setReconnectCooldownSec(RECONNECT_HANDOFF_COOLDOWN_SEC)
+    } catch {
+      setReconnectCooldownSec(RECONNECT_HANDOFF_COOLDOWN_SEC)
+    }
+  }, [joinHostSession, sessionInput])
+
+  const runIntensityProbe = useCallback(() => {
+    // Web APIs cannot detect system vibration intensity directly; this is user-confirmed.
+    const ok = canTriggerLocal ? vibratePattern([90, 45, 120]) : false
+    if (!ok) setIntensityCheck('weak')
+  }, [canTriggerLocal])
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(GUEST_INTENSITY_CHECK_STORAGE_KEY, intensityCheck)
+    } catch {
+      /* ignore */
+    }
+  }, [intensityCheck])
 
   return (
     <div className="page stack guest">
       <div className="row spread">
         <h1>GUEST</h1>
-        <button type="button" className="btn btn-ghost" onClick={onBack}>
+        <button
+          type="button"
+          className="btn btn-ghost"
+          onClick={() => {
+            endGuestConnection(connected, true)
+            onBack()
+          }}
+        >
           Change role
         </button>
       </div>
@@ -1373,6 +1721,31 @@ function GuestFlow({ onBack, supported }: { onBack: () => void; supported: boole
       </p>
 
       <GuestSignalingProgress connected={connected} busy={busy} hasAnswer={Boolean(answerText)} />
+
+      {!connected && showReconnectPanel && (
+        <section className="panel stack">
+          <h2>Reconnect</h2>
+          <p className="muted">
+            This session ended without you choosing <strong>End connection</strong> or <strong>Emergency stop</strong>.
+            The host should tap <strong>Reconnect session</strong> first. Then you can poll for a new shortcode linked to
+            your previous one
+            {savedPairCodeLabel ? <> (<strong>{savedPairCodeLabel}</strong>)</> : null}.
+          </p>
+          {!savedPairCodeLabel && sessionInput.trim().length < 5 && (
+            <p className="warn">
+              If you did not use shortcode mode, wait for a new pair code from the host and enter it above instead.
+            </p>
+          )}
+          <button
+            type="button"
+            className="btn"
+            disabled={reconnectCooldownSec > 0 || busy}
+            onClick={() => void checkReconnectHandoff()}
+          >
+            {reconnectCooldownSec > 0 ? `Check again (${reconnectCooldownSec}s)` : 'Check again for new code'}
+          </button>
+        </section>
+      )}
 
       {!connected && guestNetSnap && <IcePathPanel snap={guestNetSnap} context="guest" />}
 
@@ -1441,15 +1814,74 @@ function GuestFlow({ onBack, supported }: { onBack: () => void; supported: boole
         <section className={`panel stack ${guestLocked ? 'guest-locked-mode' : ''}`}>
           <h2>Receiving haptics</h2>
           <p className="ok">Connected. This UI is read-only.</p>
+          {canTriggerLocal && intensityCheck !== 'felt' && (
+            <p className="warn">
+              Intensity check not confirmed strong. For reliable host-to-guest testing, verify device vibration intensity
+              is set to max.
+            </p>
+          )}
           <div className="row wrap">
-            <button type="button" className="btn btn-danger" onClick={() => endGuestConnection(true)}>
+            <button type="button" className="btn btn-danger" onClick={() => setEmergencyStopOpen(true)}>
+              Emergency stop
+            </button>
+            <button type="button" className="btn btn-danger" onClick={() => endGuestConnection(true, true)}>
               End connection
             </button>
             <button type="button" className="btn" onClick={() => setGuestLocked((v) => !v)}>
               {guestLocked ? 'Unlock mode' : 'Locked mode'}
             </button>
           </div>
+          {emergencyStopOpen && (
+            <div className="panel stack" role="dialog" aria-labelledby="emergency-stop-title">
+              <h3 id="emergency-stop-title">Confirm emergency stop</h3>
+              <p className="warn">
+                Emergency stop immediately halts haptics and ends your session. Only continue if you need to stop right
+                away.
+              </p>
+              <div className="row wrap">
+                <button type="button" className="btn" onClick={() => setEmergencyStopOpen(false)}>
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  className="btn btn-danger"
+                  onClick={() => {
+                    setEmergencyStopOpen(false)
+                    stopAllGuestActions()
+                    endGuestConnection(true, true)
+                  }}
+                >
+                  Confirm emergency stop
+                </button>
+              </div>
+            </div>
+          )}
           <div className="panel stack">
+            {canTriggerLocal && (
+              <div className="panel stack">
+                <p className="muted">
+                  Browser APIs cannot detect your system vibration-intensity setting. Run this pulse and confirm what you
+                  feel.
+                </p>
+                <div className="row wrap">
+                  <button type="button" className="btn" onClick={runIntensityProbe}>
+                    Run intensity check pulse
+                  </button>
+                  <button type="button" className="btn" onClick={() => setIntensityCheck('felt')}>
+                    Felt strong
+                  </button>
+                  <button type="button" className="btn btn-danger" onClick={() => setIntensityCheck('weak')}>
+                    Weak / no vibration
+                  </button>
+                </div>
+                {intensityCheck === 'weak' && (
+                  <p className="warn">
+                    Vibration may be reduced by system settings. For reliable host-to-guest testing, raise device
+                    vibration/haptics intensity to maximum and disable battery-saver modes.
+                  </p>
+                )}
+              </div>
+            )}
             <p className="muted">
               Signal received: <strong>{lastHostMessage ? 'Yes' : 'No'}</strong> | Haptics path:{' '}
               <strong>{supported ? 'Physical vibration' : bestEffort ? 'Best effort simulation' : 'Unavailable'}</strong>

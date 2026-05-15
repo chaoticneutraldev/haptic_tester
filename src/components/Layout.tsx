@@ -30,8 +30,11 @@ export function Layout() {
       </main>
       <footer className="app-footer">
         <p>
-          Static lab tool. Web haptics use the Vibration API where available. Pairing uses WebRTC with manual
-          copy/paste signaling—no server.
+          Static lab tool. Web haptics use the Vibration API where available. Pairing uses WebRTC with shortcode and
+          manual copy/paste signaling.
+        </p>
+        <p className="app-footer__version" aria-label={`App version ${__APP_VERSION__}`}>
+          {__APP_VERSION__}
         </p>
       </footer>
     </div>

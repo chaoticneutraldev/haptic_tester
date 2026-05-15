@@ -1,14 +1,16 @@
 {
   "name": "haptic_tester",
   "private": true,
-  "version": "0.0.0",
+  "version": "0.25.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
     "lint": "eslint .",
     "preview": "vite preview",
-    "smoke:signal": "node scripts/smoke-signal.mjs"
+    "smoke:signal": "node scripts/smoke-signal.mjs",
+    "verify:version-push": "node scripts/verify-version-push.mjs",
+    "prepare": "husky"
   },
   "dependencies": {
     "qrcode.react": "^4.2.0",
@@ -26,6 +28,7 @@
     "eslint-plugin-react-hooks": "^7.1.1",
     "eslint-plugin-react-refresh": "^0.5.2",
     "globals": "^17.5.0",
+    "husky": "^9.1.7",
     "typescript": "~6.0.2",
     "typescript-eslint": "^8.58.2",
     "vite": "^8.0.10"

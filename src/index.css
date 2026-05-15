@@ -153,6 +153,20 @@ h3 {
   padding-top: 1rem;
 }
 
+.app-footer p {
+  margin: 0 0 0.5rem;
+}
+
+.app-footer p:last-child {
+  margin-bottom: 0;
+}
+
+.app-footer__version {
+  font-family: var(--mono);
+  font-size: 0.8rem;
+  opacity: 0.9;
+}
+
 .page.stack {
   display: flex;
   flex-direction: column;
@@ -670,6 +684,64 @@ textarea.input {
   border-top: 1px solid var(--border);
   background: color-mix(in srgb, var(--surface) 92%, var(--bg));
   backdrop-filter: blur(6px);
+}
+
+.host-footer-grid {
+  justify-content: flex-start;
+  align-items: stretch;
+  overflow-x: auto;
+  gap: 0.65rem;
+}
+
+.host-heartbeat-card {
+  min-width: 180px;
+  border: 1px solid var(--border);
+  border-radius: 0.55rem;
+  padding: 0.45rem 0.55rem;
+  background: color-mix(in srgb, var(--surface-2) 85%, var(--surface));
+}
+
+.host-heartbeat-card p {
+  margin: 0.2rem 0;
+}
+
+.host-heartbeat-card--actions {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 0.3rem;
+}
+
+.host-footer-grid--compact {
+  align-items: flex-start;
+}
+
+.host-heartbeat-table-wrap {
+  flex: 1 1 540px;
+  max-width: min(900px, 100vw - 260px);
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 0.55rem;
+  background: color-mix(in srgb, var(--surface-2) 85%, var(--surface));
+}
+
+.host-heartbeat-table {
+  border-collapse: collapse;
+  width: 100%;
+  min-width: 500px;
+  font-size: 0.8rem;
+}
+
+.host-heartbeat-table th,
+.host-heartbeat-table td {
+  text-align: left;
+  padding: 0.35rem 0.5rem;
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
+  white-space: nowrap;
+}
+
+.host-heartbeat-table tbody tr:last-child td {
+  border-bottom: 0;
 }
 
 code {
