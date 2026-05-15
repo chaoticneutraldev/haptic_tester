@@ -153,6 +153,20 @@ h3 {
   padding-top: 1rem;
 }
 
+.app-footer p {
+  margin: 0 0 0.5rem;
+}
+
+.app-footer p:last-child {
+  margin-bottom: 0;
+}
+
+.app-footer__version {
+  font-family: var(--mono);
+  font-size: 0.8rem;
+  opacity: 0.9;
+}
+
 .page.stack {
   display: flex;
   flex-direction: column;
