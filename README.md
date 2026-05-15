@@ -82,4 +82,4 @@ The frontend requests ICE config from `/api/turn/ice-config`. The function:
 
 - If the TURN function is unavailable, WebRTC falls back to STUN-only.
 - Pairing is shortcode-first (5-character code) with manual blob signaling as fallback.
-- Shortcode signaling uses Redis-backed state with 15-minute host/guest match TTL, then 12-hour active TTL after answer is posted.
+- Shortcode signaling uses Redis-backed state with 2-hour host/guest match TTL, then 12-hour active TTL after answer is posted. Reconnect handoff stores an optional `nextShortcode` on the prior matched session.

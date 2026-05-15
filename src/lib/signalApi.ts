@@ -6,25 +6,33 @@ export type SignalState = {
   offer?: string | null
   answer?: string | null
   matchedAt?: string | null
+  matchExpiresAt?: string | null
+  activeExpiresAt?: string | null
+  nextShortcode?: string | null
 }
 
 export async function createSignalSession(): Promise<{
   code: string
   matchExpiresInSeconds: number
   activeTtlSeconds: number
+  matchExpiresAt?: string | null
 }> {
   const res = await fetch('/api/signal/session', { method: 'POST' })
   if (!res.ok) throw new Error(`Failed creating session (${res.status})`)
   return res.json()
 }
 
-export async function postSignalOffer(code: string, payload: string): Promise<void> {
+export async function postSignalOffer(
+  code: string,
+  payload: string,
+): Promise<{ matchExpiresAt?: string | null }> {
   const res = await fetch(`/api/signal/state/${encodeURIComponent(code)}`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ kind: 'offer', payload }),
   })
   if (!res.ok) throw new Error(`Failed publishing offer (${res.status})`)
+  return res.json()
 }
 
 export async function postSignalAnswer(code: string, payload: string): Promise<void> {
@@ -34,6 +42,16 @@ export async function postSignalAnswer(code: string, payload: string): Promise<v
     body: JSON.stringify({ kind: 'answer', payload }),
   })
   if (!res.ok) throw new Error(`Failed publishing answer (${res.status})`)
+}
+
+/** After creating a fresh signaling session + offer, point the previous (matched) code at the new one for guest reconnect. */
+export async function postLinkNextShortcode(previousCode: string, nextCode: string): Promise<void> {
+  const res = await fetch(`/api/signal/state/${encodeURIComponent(previousCode)}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ kind: 'linkNext', nextCode }),
+  })
+  if (!res.ok) throw new Error(`Failed linking next shortcode (${res.status})`)
 }
 
 export async function getSignalState(code: string): Promise<SignalState> {

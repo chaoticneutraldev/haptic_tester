@@ -1,4 +1,4 @@
-const MATCH_TTL_SECONDS = 15 * 60
+const MATCH_TTL_SECONDS = 2 * 60 * 60
 const ACTIVE_TTL_SECONDS = 12 * 60 * 60
 const CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
 
@@ -46,6 +46,14 @@ function keyFor(codeValue) {
   return `signal:${codeValue}`
 }
 
+function matchExpiresIso() {
+  return new Date(Date.now() + MATCH_TTL_SECONDS * 1000).toISOString()
+}
+
+function activeExpiresIso() {
+  return new Date(Date.now() + ACTIVE_TTL_SECONDS * 1000).toISOString()
+}
+
 export async function createSession() {
   for (let i = 0; i < 10; i++) {
     const c = code(5)
@@ -56,9 +64,12 @@ export async function createSession() {
       createdAt: new Date().toISOString(),
       matchExpiresInSeconds: MATCH_TTL_SECONDS,
       activeTtlSeconds: ACTIVE_TTL_SECONDS,
+      matchExpiresAt: matchExpiresIso(),
+      activeExpiresAt: null,
       offer: null,
       answer: null,
       matchedAt: null,
+      nextShortcode: null,
     }
     const ok = await redis('SET', key, JSON.stringify(base), 'EX', MATCH_TTL_SECONDS, 'NX')
     if (ok === 'OK') return base
@@ -78,6 +89,8 @@ export async function putOffer(codeValue, offerText) {
   if (!session) throw new Error('Session not found or expired')
   session.offer = offerText
   session.updatedAt = new Date().toISOString()
+  session.matchExpiresAt = matchExpiresIso()
+  if (session.nextShortcode === undefined) session.nextShortcode = null
   await redis('SET', key, JSON.stringify(session), 'EX', MATCH_TTL_SECONDS)
   return session
 }
@@ -91,7 +104,32 @@ export async function putAnswer(codeValue, answerText) {
   session.status = 'matched'
   session.matchedAt = new Date().toISOString()
   session.updatedAt = session.matchedAt
+  session.activeExpiresAt = activeExpiresIso()
+  session.matchExpiresAt = null
+  if (session.nextShortcode === undefined) session.nextShortcode = null
   await redis('SET', key, JSON.stringify(session), 'EX', ACTIVE_TTL_SECONDS)
+  return session
+}
+
+/** Guest discovers the follow-up pair code after the host starts a fresh offer. */
+export async function putNextShortcode(previousCode, nextCode) {
+  const prev = String(previousCode ?? '').toUpperCase()
+  const next = String(nextCode ?? '').toUpperCase()
+  if (prev.length < 5 || next.length < 5) throw new Error('Invalid shortcode')
+  if (prev === next) throw new Error('Next shortcode must differ from the previous code')
+
+  const session = await getSession(prev)
+  if (!session) throw new Error('Session not found or expired')
+  if (session.status !== 'matched') throw new Error('Previous session is not matched; use a normal pair code instead')
+
+  const nextSession = await getSession(next)
+  if (!nextSession) throw new Error('Next session not found or expired')
+  if (!nextSession.offer) throw new Error('Host must publish the new offer before linking shortcodes')
+
+  session.nextShortcode = next
+  session.updatedAt = new Date().toISOString()
+  session.activeExpiresAt = activeExpiresIso()
+  await redis('SET', keyFor(prev), JSON.stringify(session), 'EX', ACTIVE_TTL_SECONDS)
   return session
 }
 
